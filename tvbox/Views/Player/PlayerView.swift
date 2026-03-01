@@ -355,7 +355,8 @@ struct AVPlayerContentView: View {
                 Text(currentTime.durationString)
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                     .foregroundColor(.white.opacity(0.9))
-                    .frame(width: 45, alignment: .leading)
+                    .lineLimit(1)
+                    .frame(width: 62, alignment: .leading)
                 
                 Slider(
                     value: Binding(
@@ -380,7 +381,8 @@ struct AVPlayerContentView: View {
                 Text(duration.durationString)
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                     .foregroundColor(.white.opacity(0.6))
-                    .frame(width: 45, alignment: .trailing)
+                    .lineLimit(1)
+                    .frame(width: 62, alignment: .trailing)
             }
             .padding(.horizontal, 4)
             
