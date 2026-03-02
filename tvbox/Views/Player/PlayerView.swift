@@ -144,6 +144,7 @@ struct PlayerView: View {
 
 /// 基于系统 AVPlayer 的点播播放器实现
 struct AVPlayerContentView: View {
+    private static let supportedPlaybackRates: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
     let urlString: String
     var startPosition: Double = 0
     var onProgressChanged: ((Double, Double?) -> Void)? = nil
@@ -152,6 +153,7 @@ struct AVPlayerContentView: View {
     var canPlayNext: Bool = false
     var onPlayNext: (() -> Void)? = nil
     var sharedController: SystemPlayerSessionController? = nil
+    @AppStorage(HawkConfig.PLAY_SPEED) private var savedPlaybackRate = 1.0
     @State private var player: AVPlayer?
     @State private var playbackEndObserver: NSObjectProtocol?
     @State private var timeObserverToken: Any?
@@ -238,10 +240,12 @@ struct AVPlayerContentView: View {
             }
         }
         .onAppear {
+            syncRateFromSettings()
             setupPlayer()
             wakeUpControls()
         }
         .onChange(of: urlString) { _, _ in
+            syncRateFromSettings()
             setupPlayer()
             wakeUpControls()
         }
@@ -255,12 +259,15 @@ struct AVPlayerContentView: View {
     private func setupPlayer() {
         guard let url = URL(string: urlString) else { return }
         let targetURLString = url.absoluteString
+        let preferredRate = normalizedSavedPlaybackRate
+        rate = preferredRate
         
         if let sharedController,
            sharedController.mediaURLString == targetURLString,
            let sharedPlayer = sharedController.player {
             cleanupPlayer(keepSharedPlayer: true)
             player = sharedPlayer
+            applyPreferredPlaybackRate(to: sharedPlayer)
             bindPlayerObservers(for: sharedPlayer)
             reportProgress(for: sharedPlayer)
             return
@@ -271,6 +278,7 @@ struct AVPlayerContentView: View {
         
         let playerItem = AVPlayerItem(url: url)
         let newPlayer = AVPlayer(playerItem: playerItem)
+        newPlayer.defaultRate = preferredRate
         if let sharedController {
             sharedController.setPlayer(newPlayer, urlString: targetURLString)
         }
@@ -295,8 +303,15 @@ struct AVPlayerContentView: View {
                 DispatchQueue.main.async { volume = vol }
             },
             player.observe(\.rate, options: [.new]) { p, _ in
-                let r = p.rate
-                DispatchQueue.main.async { rate = r }
+                let currentRate = p.rate
+                guard currentRate > 0 else { return }
+                let normalized = Self.normalizedPlaybackRate(from: currentRate)
+                DispatchQueue.main.async {
+                    rate = normalized
+                    if abs(savedPlaybackRate - Double(normalized)) > 0.001 {
+                        savedPlaybackRate = Double(normalized)
+                    }
+                }
             }
         ]
         observePlaybackProgress(for: player)
@@ -304,7 +319,7 @@ struct AVPlayerContentView: View {
         isPlaying = player.timeControlStatus == .playing
         isPreparing = player.reasonForWaitingToPlay != nil
         volume = Double(player.volume)
-        rate = player.rate
+        rate = normalizedSavedPlaybackRate
     }
     
     private func detachPlayerObservers() {
@@ -346,17 +361,17 @@ struct AVPlayerContentView: View {
             let seekTime = CMTime(seconds: target, preferredTimescale: 600)
             player.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
                 reportProgress(for: player)
-                player.play()
+                playAtPreferredRate(player)
             }
         } else {
-            player.play()
+            playAtPreferredRate(player)
         }
     }
     
     private func togglePlayPause() {
         guard let player = player else { return }
         if player.rate == 0 {
-            player.play()
+            playAtPreferredRate(player)
         } else {
             player.pause()
         }
@@ -593,15 +608,15 @@ struct AVPlayerContentView: View {
 
     private var playbackRateMenu: some View {
         Menu {
-            ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in
+            ForEach(Self.supportedPlaybackRates, id: \.self) { r in
                 Button {
                     wakeUpControls()
-                    player?.rate = Float(r)
+                    setPlaybackRate(r)
                     showOSD(icon: "speedometer")
                 } label: {
                     HStack {
                         Text("\(String(format: "%.1f", r))x")
-                        if Float(r) == rate {
+                        if r == rate {
                             Spacer()
                             Image(systemName: "checkmark")
                         }
@@ -630,6 +645,46 @@ struct AVPlayerContentView: View {
         return "speaker.wave.2.fill"
     }
 
+    private var normalizedSavedPlaybackRate: Float {
+        Self.normalizedPlaybackRate(from: Float(savedPlaybackRate))
+    }
+
+    private static func normalizedPlaybackRate(from raw: Float) -> Float {
+        guard !supportedPlaybackRates.isEmpty else { return 1.0 }
+        return supportedPlaybackRates.min(by: { abs($0 - raw) < abs($1 - raw) }) ?? 1.0
+    }
+
+    private func syncRateFromSettings() {
+        rate = normalizedSavedPlaybackRate
+    }
+
+    private func setPlaybackRate(_ value: Float) {
+        let normalized = Self.normalizedPlaybackRate(from: value)
+        rate = normalized
+        savedPlaybackRate = Double(normalized)
+        guard let player else { return }
+        player.defaultRate = normalized
+        if player.rate > 0 {
+            player.rate = normalized
+        }
+    }
+
+    private func applyPreferredPlaybackRate(to player: AVPlayer) {
+        let normalized = normalizedSavedPlaybackRate
+        rate = normalized
+        player.defaultRate = normalized
+        if player.rate > 0 {
+            player.rate = normalized
+        }
+    }
+
+    private func playAtPreferredRate(_ player: AVPlayer) {
+        let normalized = normalizedSavedPlaybackRate
+        rate = normalized
+        player.defaultRate = normalized
+        player.playImmediately(atRate: normalized)
+    }
+
     private func seek(to seconds: Double) {
         guard let player = player else { return }
         let time = CMTime(seconds: seconds, preferredTimescale: 600)
@@ -651,7 +706,7 @@ struct AVPlayerContentView: View {
         player.seek(to: CMTime(seconds: target, preferredTimescale: 600)) { _ in
             reportProgress(for: player)
             if wasPlaying {
-                player.play()
+                playAtPreferredRate(player)
             }
         }
     }
