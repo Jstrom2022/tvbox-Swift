@@ -34,19 +34,24 @@ class SourceService {
             jsonStr = try await network.getString(from: api)
         } else if sourceBean.type == 4 {
             // Type 4: 远程接口，需要 extend 和 filter 参数
-            var url = api.contains("?") ? "\(api)&filter=true" : "\(api)?filter=true"
+            var queryItems: [URLQueryItem] = [
+                URLQueryItem(name: "filter", value: "true")
+            ]
             // 加载 extend
             if let ext = sourceBean.ext, !ext.isEmpty {
                 let extend = await resolveExtend(ext)
                 if !extend.isEmpty {
-                    let encoded = extend.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? extend
-                    url += "&extend=\(encoded)"
+                    queryItems.append(URLQueryItem(name: "extend", value: extend))
                 }
             }
+            let url = try buildURL(base: api, queryItems: queryItems)
             jsonStr = try await network.getString(from: url)
         } else {
             // JSON 接口 (type=1)
-            let url = api.contains("?") ? "\(api)&ac=class" : "\(api)?ac=class"
+            let url = try buildURL(
+                base: api,
+                queryItems: [URLQueryItem(name: "ac", value: "class")]
+            )
             jsonStr = try await network.getString(from: url)
         }
         
@@ -62,12 +67,24 @@ class SourceService {
             if sourceBean.type == 4 {
                 // type=4 用 ac=detail 格式，与 getList 保持一致
                 let ext = Data("{}".utf8).base64EncodedString()
-                listUrl = api.contains("?")
-                    ? "\(api)&ac=detail&filter=true&pg=1&ext=\(ext)"
-                    : "\(api)?ac=detail&filter=true&pg=1&ext=\(ext)"
+                listUrl = try buildURL(
+                    base: api,
+                    queryItems: [
+                        URLQueryItem(name: "ac", value: "detail"),
+                        URLQueryItem(name: "filter", value: "true"),
+                        URLQueryItem(name: "pg", value: "1"),
+                        URLQueryItem(name: "ext", value: ext)
+                    ]
+                )
             } else {
                 // type=1 用 ac=videolist 格式
-                listUrl = api.contains("?") ? "\(api)&ac=videolist&pg=1" : "\(api)?ac=videolist&pg=1"
+                listUrl = try buildURL(
+                    base: api,
+                    queryItems: [
+                        URLQueryItem(name: "ac", value: "videolist"),
+                        URLQueryItem(name: "pg", value: "1")
+                    ]
+                )
             }
             if let listStr = try? await network.getString(from: listUrl) {
                 let fallback = (try? parseVideoList(listStr, sourceKey: sourceBean.key, type: sourceBean.type)) ?? []
@@ -152,48 +169,61 @@ class SourceService {
         guard sourceBean.isSupportedInSwift else { throw SourceError.unsupportedType(sourceBean.typeDescription) }
         guard sourceBean.isHttpApi else { throw SourceError.invalidApiUrl(api) }
         
-        var url: String
+        let url: String
         if sourceBean.type == 0 {
             // XML 接口
-            url = "\(api)?ac=videolist&t=\(sortData.id)&pg=\(page)"
+            url = try buildURL(
+                base: api,
+                queryItems: [
+                    URLQueryItem(name: "ac", value: "videolist"),
+                    URLQueryItem(name: "t", value: sortData.id),
+                    URLQueryItem(name: "pg", value: String(page))
+                ]
+            )
         } else if sourceBean.type == 4 {
             // Type 4: 远程接口
-            url = api.contains("?")
-                ? "\(api)&ac=detail&filter=true&t=\(sortData.id)&pg=\(page)"
-                : "\(api)?ac=detail&filter=true&t=\(sortData.id)&pg=\(page)"
+            var queryItems: [URLQueryItem] = [
+                URLQueryItem(name: "ac", value: "detail"),
+                URLQueryItem(name: "filter", value: "true"),
+                URLQueryItem(name: "t", value: sortData.id),
+                URLQueryItem(name: "pg", value: String(page))
+            ]
             
             // 附加筛选参数（base64 编码）
             if let filters = filters, !filters.isEmpty {
                 if let filterData = try? JSONSerialization.data(withJSONObject: filters),
                    let filterStr = String(data: filterData, encoding: .utf8) {
                     let ext = Data(filterStr.utf8).base64EncodedString()
-                    url += "&ext=\(ext)"
+                    queryItems.append(URLQueryItem(name: "ext", value: ext))
                 }
             } else {
                 let ext = Data("{}".utf8).base64EncodedString()
-                url += "&ext=\(ext)"
+                queryItems.append(URLQueryItem(name: "ext", value: ext))
             }
             
             // 加载 extend
             if let ext = sourceBean.ext, !ext.isEmpty {
                 let extend = await resolveExtend(ext)
                 if !extend.isEmpty {
-                    let encoded = extend.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? extend
-                    url += "&extend=\(encoded)"
+                    queryItems.append(URLQueryItem(name: "extend", value: extend))
                 }
             }
+            url = try buildURL(base: api, queryItems: queryItems)
         } else {
             // JSON 接口 (type=1)
-            url = api.contains("?")
-                ? "\(api)&ac=videolist&t=\(sortData.id)&pg=\(page)"
-                : "\(api)?ac=videolist&t=\(sortData.id)&pg=\(page)"
+            var queryItems: [URLQueryItem] = [
+                URLQueryItem(name: "ac", value: "videolist"),
+                URLQueryItem(name: "t", value: sortData.id),
+                URLQueryItem(name: "pg", value: String(page))
+            ]
             
             // 附加筛选参数
             if let filters = filters {
                 for (key, value) in filters {
-                    url += "&\(key)=\(value)"
+                    queryItems.append(URLQueryItem(name: key, value: value))
                 }
             }
+            url = try buildURL(base: api, queryItems: queryItems)
         }
         
         let jsonStr = try await network.getString(from: url)
@@ -255,28 +285,39 @@ class SourceService {
         guard sourceBean.isSupportedInSwift else { throw SourceError.unsupportedType(sourceBean.typeDescription) }
         guard sourceBean.isHttpApi else { throw SourceError.invalidApiUrl(api) }
         
-        var url: String
+        let url: String
         if sourceBean.type == 0 {
-            url = "\(api)?ac=videolist&ids=\(vodId)"
+            url = try buildURL(
+                base: api,
+                queryItems: [
+                    URLQueryItem(name: "ac", value: "videolist"),
+                    URLQueryItem(name: "ids", value: vodId)
+                ]
+            )
         } else if sourceBean.type == 4 {
             // Type 4: 远程接口
-            url = api.contains("?")
-                ? "\(api)&ac=detail&ids=\(vodId)"
-                : "\(api)?ac=detail&ids=\(vodId)"
+            var queryItems: [URLQueryItem] = [
+                URLQueryItem(name: "ac", value: "detail"),
+                URLQueryItem(name: "ids", value: vodId)
+            ]
             
             // 加载 extend
             if let ext = sourceBean.ext, !ext.isEmpty {
                 let extend = await resolveExtend(ext)
                 if !extend.isEmpty {
-                    let encoded = extend.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? extend
-                    url += "&extend=\(encoded)"
+                    queryItems.append(URLQueryItem(name: "extend", value: extend))
                 }
             }
+            url = try buildURL(base: api, queryItems: queryItems)
         } else {
             // JSON 接口 (type=1)
-            url = api.contains("?")
-                ? "\(api)&ac=detail&ids=\(vodId)"
-                : "\(api)?ac=detail&ids=\(vodId)"
+            url = try buildURL(
+                base: api,
+                queryItems: [
+                    URLQueryItem(name: "ac", value: "detail"),
+                    URLQueryItem(name: "ids", value: vodId)
+                ]
+            )
         }
         
         let jsonStr = try await network.getString(from: url)
@@ -284,25 +325,27 @@ class SourceService {
     }
     
     private func parseDetail(_ jsonStr: String, sourceKey: String, type: Int) throws -> VodInfo? {
+        if type == 0 {
+            return parseXMLDetail(jsonStr, sourceKey: sourceKey)
+        }
+        
         guard let data = jsonStr.data(using: .utf8) else {
             throw SourceError.parseError("无法解析数据")
         }
         
-        if type == 1 || type == 4 {
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let list = json["list"] as? [[String: Any]],
-               let first = list.first {
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let list = json["list"] as? [[String: Any]],
+           let first = list.first {
+            
+            let decoder = JSONDecoder()
+            if let itemData = try? JSONSerialization.data(withJSONObject: first),
+               var video = try? decoder.decode(Movie.Video.self, from: itemData) {
+                video.sourceKey = sourceKey
                 
-                let decoder = JSONDecoder()
-                if let itemData = try? JSONSerialization.data(withJSONObject: first),
-                   var video = try? decoder.decode(Movie.Video.self, from: itemData) {
-                    video.sourceKey = sourceKey
-                    
-                    let playFrom = first["vod_play_from"] as? String ?? ""
-                    let playUrl = first["vod_play_url"] as? String ?? ""
-                    
-                    return VodInfo.from(video: video, playFrom: playFrom, playUrl: playUrl)
-                }
+                let playFrom = first["vod_play_from"] as? String ?? ""
+                let playUrl = first["vod_play_url"] as? String ?? ""
+                
+                return VodInfo.from(video: video, playFrom: playFrom, playUrl: playUrl)
             }
         }
         
@@ -318,31 +361,35 @@ class SourceService {
         guard sourceBean.isSupportedInSwift else { throw SourceError.unsupportedType(sourceBean.typeDescription) }
         guard sourceBean.isHttpApi else { throw SourceError.invalidApiUrl(api) }
         
-        let encodedKeyword = keyword.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? keyword
-        
-        var url: String
+        let url: String
         if sourceBean.type == 0 {
-            url = "\(api)?wd=\(encodedKeyword)"
+            url = try buildURL(
+                base: api,
+                queryItems: [URLQueryItem(name: "wd", value: keyword)]
+            )
         } else if sourceBean.type == 4 {
             // Type 4: 远程接口
             let quickValue = sourceBean.isQuickSearchEnabled ? "true" : "false"
-            url = api.contains("?")
-                ? "\(api)&wd=\(encodedKeyword)&ac=detail&quick=\(quickValue)"
-                : "\(api)?wd=\(encodedKeyword)&ac=detail&quick=\(quickValue)"
+            var queryItems: [URLQueryItem] = [
+                URLQueryItem(name: "wd", value: keyword),
+                URLQueryItem(name: "ac", value: "detail"),
+                URLQueryItem(name: "quick", value: quickValue)
+            ]
             
             // 加载 extend
             if let ext = sourceBean.ext, !ext.isEmpty {
                 let extend = await resolveExtend(ext)
                 if !extend.isEmpty {
-                    let encoded = extend.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? extend
-                    url += "&extend=\(encoded)"
+                    queryItems.append(URLQueryItem(name: "extend", value: extend))
                 }
             }
+            url = try buildURL(base: api, queryItems: queryItems)
         } else {
             // JSON 接口 (type=1)
-            url = api.contains("?")
-                ? "\(api)&wd=\(encodedKeyword)"
-                : "\(api)?wd=\(encodedKeyword)"
+            url = try buildURL(
+                base: api,
+                queryItems: [URLQueryItem(name: "wd", value: keyword)]
+            )
         }
         
         let jsonStr = try await network.getString(from: url)
@@ -436,6 +483,128 @@ class SourceService {
         } catch {
             return extend
         }
+    }
+
+    private func parseXMLDetail(_ xml: String, sourceKey: String) -> VodInfo? {
+        guard let videoBlock = firstMatch(
+            pattern: #"<video[\s\S]*?</video>"#,
+            in: xml
+        ) else {
+            return nil
+        }
+        
+        let vodId = extractXMLTag("id", in: videoBlock)
+        guard !vodId.isEmpty else { return nil }
+        
+        var video = Movie.Video(id: vodId)
+        video.name = extractXMLTag("name", in: videoBlock)
+        video.pic = extractXMLTag("pic", in: videoBlock)
+        video.note = extractXMLTag("note", in: videoBlock)
+        video.year = extractXMLTag("year", in: videoBlock)
+        video.area = extractXMLTag("area", in: videoBlock)
+        video.type = extractXMLTag("type", in: videoBlock)
+        video.director = extractXMLTag("director", in: videoBlock)
+        video.actor = extractXMLTag("actor", in: videoBlock)
+        video.des = extractXMLTag("des", in: videoBlock)
+        video.sourceKey = sourceKey
+        
+        let ddNodes = extractXMLDDNodes(from: videoBlock)
+        let playFrom: String
+        let playUrl: String
+        
+        if ddNodes.isEmpty {
+            playFrom = "默认"
+            playUrl = ""
+        } else {
+            playFrom = ddNodes.map { $0.flag }.joined(separator: "$$$")
+            playUrl = ddNodes.map { $0.url }.joined(separator: "$$$")
+        }
+        
+        return VodInfo.from(video: video, playFrom: playFrom, playUrl: playUrl)
+    }
+    
+    private func extractXMLDDNodes(from block: String) -> [(flag: String, url: String)] {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"<dd([^>]*)>([\s\S]*?)</dd>"#,
+            options: [.caseInsensitive]
+        ) else {
+            return []
+        }
+        
+        let nsRange = NSRange(block.startIndex..<block.endIndex, in: block)
+        let matches = regex.matches(in: block, range: nsRange)
+        var result: [(flag: String, url: String)] = []
+        
+        for (index, match) in matches.enumerated() {
+            guard match.numberOfRanges >= 3 else { continue }
+            guard let attrRange = Range(match.range(at: 1), in: block),
+                  let valueRange = Range(match.range(at: 2), in: block) else {
+                continue
+            }
+            
+            let attrs = String(block[attrRange])
+            let rawUrl = decodeXMLText(String(block[valueRange]))
+            guard !rawUrl.isEmpty else { continue }
+            
+            let flag = firstMatch(
+                pattern: #"flag\s*=\s*["']([^"']+)["']"#,
+                in: attrs,
+                captureGroup: 1
+            ) ?? "线路\(index + 1)"
+            result.append((flag: decodeXMLText(flag), url: rawUrl))
+        }
+        
+        return result
+    }
+    
+    private func extractXMLTag(_ tag: String, in content: String) -> String {
+        let escapedTag = NSRegularExpression.escapedPattern(for: tag)
+        let pattern = "<\(escapedTag)>\\s*([\\s\\S]*?)\\s*</\(escapedTag)>"
+        let value = firstMatch(pattern: pattern, in: content, captureGroup: 1) ?? ""
+        return decodeXMLText(value)
+    }
+    
+    private func firstMatch(pattern: String, in content: String, captureGroup: Int = 0) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+        let range = NSRange(content.startIndex..<content.endIndex, in: content)
+        guard let match = regex.firstMatch(in: content, options: [], range: range),
+              match.numberOfRanges > captureGroup,
+              let subRange = Range(match.range(at: captureGroup), in: content) else {
+            return nil
+        }
+        return String(content[subRange])
+    }
+    
+    private func decodeXMLText(_ raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.hasPrefix("<![CDATA["), value.hasSuffix("]]>"), value.count >= 12 {
+            value.removeFirst(9)
+            value.removeLast(3)
+        }
+        value = value.replacingOccurrences(of: "&amp;", with: "&")
+        value = value.replacingOccurrences(of: "&lt;", with: "<")
+        value = value.replacingOccurrences(of: "&gt;", with: ">")
+        value = value.replacingOccurrences(of: "&quot;", with: "\"")
+        value = value.replacingOccurrences(of: "&#39;", with: "'")
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    
+    private func buildURL(base: String, queryItems: [URLQueryItem]) throws -> String {
+        let trimmedBase = base.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard var components = URLComponents(string: trimmedBase) else {
+            throw SourceError.invalidApiUrl(base)
+        }
+        
+        var mergedQueryItems = components.queryItems ?? []
+        mergedQueryItems.append(contentsOf: queryItems)
+        components.queryItems = mergedQueryItems
+        
+        guard let url = components.url else {
+            throw SourceError.invalidApiUrl(base)
+        }
+        return url.absoluteString
     }
 }
 

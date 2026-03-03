@@ -3,6 +3,13 @@ import SwiftData
 
 /// SwiftData 持久化模型 - 对应 Android 版 Room 数据库
 
+/// 收藏/历史的业务唯一键（source + vodId）。
+private func makeVodBusinessKey(vodId: String, sourceKey: String) -> String {
+    let normalizedVodId = vodId.trimmingCharacters(in: .whitespacesAndNewlines)
+    let normalizedSourceKey = sourceKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    return "\(normalizedSourceKey)::\(normalizedVodId)"
+}
+
 /// 单部剧的续播状态
 struct VodPlaybackState: Codable {
     /// 当前播放线路标识。
@@ -16,6 +23,8 @@ struct VodPlaybackState: Codable {
 /// 视频收藏
 @Model
 final class VodCollect {
+    /// 业务唯一键（sourceKey + vodId）。
+    var bizKey: String = ""
     /// 视频 ID（与 sourceKey 组成唯一语义键）。
     var vodId: String = ""
     /// 片名。
@@ -28,6 +37,7 @@ final class VodCollect {
     var updateTime: Date = Date()
     
     init(vodId: String, vodName: String, vodPic: String, sourceKey: String) {
+        self.bizKey = makeVodBusinessKey(vodId: vodId, sourceKey: sourceKey)
         self.vodId = vodId
         self.vodName = vodName
         self.vodPic = vodPic
@@ -39,6 +49,8 @@ final class VodCollect {
 /// 播放历史记录
 @Model
 final class VodRecord {
+    /// 业务唯一键（sourceKey + vodId）。
+    var bizKey: String = ""
     /// 视频 ID。
     var vodId: String = ""
     /// 片名。
@@ -55,6 +67,7 @@ final class VodRecord {
     var updateTime: Date = Date()
     
     init(vodId: String, vodName: String, vodPic: String, sourceKey: String, playNote: String = "") {
+        self.bizKey = makeVodBusinessKey(vodId: vodId, sourceKey: sourceKey)
         self.vodId = vodId
         self.vodName = vodName
         self.vodPic = vodPic
@@ -89,50 +102,64 @@ actor CacheStore {
     
     @MainActor
     func addCollect(_ video: Movie.Video, context: ModelContext) {
-        // 先检查是否已存在
         let vodId = video.id
         let sourceKey = video.sourceKey
-        let predicate = #Predicate<VodCollect> { item in
-            item.vodId == vodId && item.sourceKey == sourceKey
-        }
-        let descriptor = FetchDescriptor<VodCollect>(predicate: predicate)
+        let bizKey = makeVodBusinessKey(vodId: vodId, sourceKey: sourceKey)
         
-        if let existing = try? context.fetch(descriptor), !existing.isEmpty {
-            return // 已收藏
+        do {
+            let matched = try fetchCollects(vodId: vodId, sourceKey: sourceKey, context: context)
+            if let first = matched.first {
+                first.bizKey = bizKey
+                first.vodName = video.name
+                first.vodPic = video.pic
+                first.updateTime = Date()
+                for duplicate in matched.dropFirst() {
+                    context.delete(duplicate)
+                }
+            } else {
+                let collect = VodCollect(
+                    vodId: vodId,
+                    vodName: video.name,
+                    vodPic: video.pic,
+                    sourceKey: sourceKey
+                )
+                context.insert(collect)
+            }
+            try context.save()
+        } catch {
+            print("写入收藏失败: \(error)")
         }
-        
-        let collect = VodCollect(
-            vodId: video.id,
-            vodName: video.name,
-            vodPic: video.pic,
-            sourceKey: video.sourceKey
-        )
-        context.insert(collect)
-        try? context.save()
     }
     
     @MainActor
     func removeCollect(vodId: String, sourceKey: String, context: ModelContext) {
-        // 收藏以 (vodId, sourceKey) 为业务唯一键，删除时也按该组合匹配。
-        let predicate = #Predicate<VodCollect> { item in
-            item.vodId == vodId && item.sourceKey == sourceKey
-        }
-        let descriptor = FetchDescriptor<VodCollect>(predicate: predicate)
-        if let items = try? context.fetch(descriptor) {
+        do {
+            let items = try fetchCollects(vodId: vodId, sourceKey: sourceKey, context: context)
+            guard !items.isEmpty else { return }
             for item in items {
                 context.delete(item)
             }
-            try? context.save()
+            try context.save()
+        } catch {
+            print("删除收藏失败: \(error)")
         }
     }
     
     @MainActor
     func isCollected(vodId: String, sourceKey: String, context: ModelContext) -> Bool {
+        let bizKey = makeVodBusinessKey(vodId: vodId, sourceKey: sourceKey)
         let predicate = #Predicate<VodCollect> { item in
-            item.vodId == vodId && item.sourceKey == sourceKey
+            item.bizKey == bizKey || (item.bizKey == "" && item.vodId == vodId && item.sourceKey == sourceKey)
         }
         let descriptor = FetchDescriptor<VodCollect>(predicate: predicate)
-        return (try? context.fetchCount(descriptor)) ?? 0 > 0
+        
+        do {
+            let count = try context.fetchCount(descriptor)
+            return count > 0
+        } catch {
+            print("查询收藏状态失败: \(error)")
+            return false
+        }
     }
     
     @MainActor
@@ -144,39 +171,55 @@ actor CacheStore {
     ) {
         let vodId = video.id
         let sourceKey = video.sourceKey
-        let record = fetchRecord(vodId: vodId, sourceKey: sourceKey, context: context)
         let encodedState = Self.encodePlaybackState(playbackState)
+        let bizKey = makeVodBusinessKey(vodId: vodId, sourceKey: sourceKey)
         
-        // 更新或插入
-        if let record {
-            record.playNote = playNote
-            if let encodedState {
-                record.dataJson = encodedState
+        do {
+            let matched = try fetchRecords(vodId: vodId, sourceKey: sourceKey, context: context)
+            
+            // 更新或插入
+            if let record = matched.first {
+                record.bizKey = bizKey
+                record.playNote = playNote
+                if let encodedState {
+                    record.dataJson = encodedState
+                }
+                record.updateTime = Date()
+                for duplicate in matched.dropFirst() {
+                    context.delete(duplicate)
+                }
+            } else {
+                let record = VodRecord(
+                    vodId: vodId,
+                    vodName: video.name,
+                    vodPic: video.pic,
+                    sourceKey: sourceKey,
+                    playNote: playNote
+                )
+                if let encodedState {
+                    record.dataJson = encodedState
+                }
+                context.insert(record)
             }
-            record.updateTime = Date()
-        } else {
-            let record = VodRecord(
-                vodId: video.id,
-                vodName: video.name,
-                vodPic: video.pic,
-                sourceKey: video.sourceKey,
-                playNote: playNote
-            )
-            if let encodedState {
-                record.dataJson = encodedState
-            }
-            context.insert(record)
+            
+            try context.save()
+        } catch {
+            print("写入播放记录失败: \(error)")
         }
-        try? context.save()
     }
     
     /// 读取续播状态（若无记录或 JSON 无法解码则返回 `nil`）。
     @MainActor
     func getPlaybackState(vodId: String, sourceKey: String, context: ModelContext) -> VodPlaybackState? {
-        guard let record = fetchRecord(vodId: vodId, sourceKey: sourceKey, context: context) else {
+        do {
+            guard let record = try fetchRecords(vodId: vodId, sourceKey: sourceKey, context: context).first else {
+                return nil
+            }
+            return Self.decodePlaybackState(record.dataJson)
+        } catch {
+            print("读取续播状态失败: \(error)")
             return nil
         }
-        return Self.decodePlaybackState(record.dataJson)
     }
     
     @MainActor
@@ -190,14 +233,47 @@ actor CacheStore {
     }
     
     @MainActor
-    private func fetchRecord(vodId: String, sourceKey: String, context: ModelContext) -> VodRecord? {
-        // 历史记录同样以 (vodId, sourceKey) 作为业务键。
+    private func fetchRecords(vodId: String, sourceKey: String, context: ModelContext) throws -> [VodRecord] {
+        let bizKey = makeVodBusinessKey(vodId: vodId, sourceKey: sourceKey)
         let predicate = #Predicate<VodRecord> { item in
-            item.vodId == vodId && item.sourceKey == sourceKey
+            item.bizKey == bizKey || (item.bizKey == "" && item.vodId == vodId && item.sourceKey == sourceKey)
         }
         let descriptor = FetchDescriptor<VodRecord>(predicate: predicate)
-        guard let records = try? context.fetch(descriptor) else { return nil }
-        return records.first
+        let records = try context.fetch(descriptor)
+        
+        // 兼容旧数据：命中 legacy 记录时补写业务键。
+        var needsSave = false
+        for record in records where record.bizKey.isEmpty {
+            record.bizKey = bizKey
+            needsSave = true
+        }
+        if needsSave {
+            try context.save()
+        }
+        
+        return records.sorted(by: { $0.updateTime > $1.updateTime })
+    }
+    
+    @MainActor
+    private func fetchCollects(vodId: String, sourceKey: String, context: ModelContext) throws -> [VodCollect] {
+        let bizKey = makeVodBusinessKey(vodId: vodId, sourceKey: sourceKey)
+        let predicate = #Predicate<VodCollect> { item in
+            item.bizKey == bizKey || (item.bizKey == "" && item.vodId == vodId && item.sourceKey == sourceKey)
+        }
+        let descriptor = FetchDescriptor<VodCollect>(predicate: predicate)
+        let collects = try context.fetch(descriptor)
+        
+        // 兼容旧数据：命中 legacy 记录时补写业务键。
+        var needsSave = false
+        for collect in collects where collect.bizKey.isEmpty {
+            collect.bizKey = bizKey
+            needsSave = true
+        }
+        if needsSave {
+            try context.save()
+        }
+        
+        return collects.sorted(by: { $0.updateTime > $1.updateTime })
     }
     
     private nonisolated static func encodePlaybackState(_ state: VodPlaybackState?) -> String? {

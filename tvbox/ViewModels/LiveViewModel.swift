@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Combine
 
 /// 直播 ViewModel
 @MainActor
@@ -19,12 +20,16 @@ class LiveViewModel: ObservableObject {
     /// 是否显示频道列表（预留给 TV 遥控交互）。
     @Published var showChannelList = false
     
+    /// 订阅配置更新，支持直播频道列表实时刷新。
+    private var cancellables: Set<AnyCancellable> = []
+    
+    init() {
+        bindLiveChannelGroups()
+    }
+    
     /// 加载直播频道
     func loadChannels() {
-        self.channelGroups = ApiConfig.shared.liveChannelGroupList
-        if let firstGroup = channelGroups.first, let firstChannel = firstGroup.channels.first {
-            currentChannel = firstChannel
-        }
+        applyChannelGroups(ApiConfig.shared.liveChannelGroupList)
     }
     
     /// 选择频道分组
@@ -89,6 +94,60 @@ class LiveViewModel: ObservableObject {
         // 预留：后续可在此按频道名/频道 ID 请求远程 EPG。
         // 当前版本先清空，避免展示过期节目单。
         epgList = []
+    }
+    
+    private func bindLiveChannelGroups() {
+        ApiConfig.shared.$liveChannelGroupList
+            .sink { [weak self] groups in
+                self?.applyChannelGroups(groups)
+            }
+            .store(in: &cancellables)
+    }
+    
+    private func applyChannelGroups(_ groups: [LiveChannelGroup]) {
+        let previousChannelId = currentChannel?.id
+        channelGroups = groups
+        
+        guard !groups.isEmpty else {
+            selectedGroupIndex = 0
+            selectedChannelIndex = 0
+            currentChannel = nil
+            return
+        }
+        
+        if let previousChannelId,
+           let located = locateChannel(withId: previousChannelId, in: groups) {
+            selectedGroupIndex = located.groupIndex
+            selectedChannelIndex = located.channelIndex
+            currentChannel = groups[located.groupIndex].channels[located.channelIndex]
+            return
+        }
+        
+        let clampedGroupIndex = min(max(0, selectedGroupIndex), groups.count - 1)
+        selectedGroupIndex = clampedGroupIndex
+        
+        let channels = groups[clampedGroupIndex].channels
+        guard !channels.isEmpty else {
+            selectedChannelIndex = 0
+            currentChannel = nil
+            return
+        }
+        
+        let clampedChannelIndex = min(max(0, selectedChannelIndex), channels.count - 1)
+        selectedChannelIndex = clampedChannelIndex
+        currentChannel = channels[clampedChannelIndex]
+    }
+    
+    private func locateChannel(
+        withId channelId: String,
+        in groups: [LiveChannelGroup]
+    ) -> (groupIndex: Int, channelIndex: Int)? {
+        for (groupIndex, group) in groups.enumerated() {
+            if let channelIndex = group.channels.firstIndex(where: { $0.id == channelId }) {
+                return (groupIndex, channelIndex)
+            }
+        }
+        return nil
     }
 }
 

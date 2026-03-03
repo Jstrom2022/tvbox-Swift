@@ -7,6 +7,8 @@ class ApiConfig: ObservableObject {
     static let shared = ApiConfig()
     private static let maxConfigResolveDepth = 6
     private static let maxRedirectCandidates = 20
+    private static let rawConfigCacheTTL: TimeInterval = 20
+    private static let maxRawConfigCacheEntries = 24
     
     struct MultiRepoOption: Identifiable, Equatable {
         let name: String
@@ -26,6 +28,13 @@ class ApiConfig: ObservableObject {
     @Published var wallpaper: String = ""
     
     private let network = NetworkManager.shared
+    private var activeLoadToken = UUID()
+    private var liveParseTask: Task<Void, Never>?
+    private struct RawConfigCacheEntry {
+        let content: String
+        let fetchedAt: Date
+    }
+    private var rawConfigCache: [String: RawConfigCacheEntry] = [:]
     
     private init() {}
     
@@ -41,6 +50,10 @@ class ApiConfig: ObservableObject {
         guard !trimmedVod.isEmpty else {
             throw ConfigError.parseError("点播接口地址不能为空")
         }
+        let loadToken = UUID()
+        activeLoadToken = loadToken
+        liveParseTask?.cancel()
+        liveParseTask = nil
         
         let resolvedLive = trimmedLive.isEmpty ? trimmedVod : trimmedLive
         self.configUrl = trimmedVod
@@ -48,31 +61,54 @@ class ApiConfig: ObservableObject {
         
         if trimmedVod == resolvedLive {
             let configResult = try await fetchConfig(from: trimmedVod)
-            parseConfig(
+            guard activeLoadToken == loadToken else { return }
+            await parseConfig(
                 configResult.config,
                 apiUrl: configResult.loadedFrom,
                 includeSources: true,
-                includeLive: true
+                includeLive: false,
+                loadToken: loadToken
+            )
+            scheduleLiveParsing(
+                config: configResult.config,
+                apiUrl: configResult.loadedFrom,
+                loadToken: loadToken
             )
         } else {
-            let vodConfig = try await fetchConfig(from: trimmedVod)
-            parseConfig(
+            async let vodConfigTask = fetchConfig(from: trimmedVod)
+            async let liveConfigTask = fetchConfig(from: resolvedLive)
+            let (vodConfig, liveConfig) = try await (vodConfigTask, liveConfigTask)
+            guard activeLoadToken == loadToken else { return }
+            await parseConfig(
                 vodConfig.config,
                 apiUrl: vodConfig.loadedFrom,
                 includeSources: true,
-                includeLive: false
+                includeLive: false,
+                loadToken: loadToken
             )
-            
-            let liveConfig = try await fetchConfig(from: resolvedLive)
-            parseConfig(
-                liveConfig.config,
+            scheduleLiveParsing(
+                config: liveConfig.config,
                 apiUrl: liveConfig.loadedFrom,
-                includeSources: false,
-                includeLive: true
+                loadToken: loadToken
             )
         }
+        guard activeLoadToken == loadToken else { return }
         
         self.isLoaded = true
+    }
+
+    /// 直播分组改为后台解析，避免阻塞首页首屏进入。
+    private func scheduleLiveParsing(config: AppConfigData, apiUrl: String, loadToken: UUID) {
+        liveParseTask?.cancel()
+        liveParseTask = Task { [config, apiUrl] in
+            await parseConfig(
+                config,
+                apiUrl: apiUrl,
+                includeSources: false,
+                includeLive: true,
+                loadToken: loadToken
+            )
+        }
     }
     
     private func fetchConfig(from apiUrl: String) async throws -> (config: AppConfigData, loadedFrom: String) {
@@ -105,7 +141,7 @@ class ApiConfig: ObservableObject {
         var nextVisited = visitedUrls
         nextVisited.insert(visitKey)
         
-        let jsonStr = try await network.getString(from: normalizedUrl)
+        let jsonStr = try await fetchConfigText(from: normalizedUrl)
         
         // 清理非标准 JSON（Android 端 Gson 默认支持注释，Swift 需要手动处理）
         let cleanedJson = Self.stripJsonComments(jsonStr)
@@ -171,6 +207,34 @@ class ApiConfig: ObservableObject {
         }
         
         throw ConfigError.parseError("配置格式不受支持")
+    }
+    
+    /// 读取配置文本并做短时缓存，避免“多仓探测 + 正式加载”重复请求同一地址。
+    private func fetchConfigText(from normalizedUrl: String) async throws -> String {
+        let key = normalizedUrl.lowercased()
+        let now = Date()
+        
+        if let entry = rawConfigCache[key] {
+            if now.timeIntervalSince(entry.fetchedAt) <= Self.rawConfigCacheTTL {
+                return entry.content
+            }
+            rawConfigCache.removeValue(forKey: key)
+        }
+        
+        let content = try await network.getString(from: normalizedUrl)
+        rawConfigCache[key] = RawConfigCacheEntry(content: content, fetchedAt: now)
+        trimRawConfigCacheIfNeeded()
+        return content
+    }
+    
+    private func trimRawConfigCacheIfNeeded() {
+        guard rawConfigCache.count > Self.maxRawConfigCacheEntries else { return }
+        let overflow = rawConfigCache.count - Self.maxRawConfigCacheEntries
+        let staleKeys = rawConfigCache
+            .sorted { $0.value.fetchedAt < $1.value.fetchedAt }
+            .prefix(overflow)
+            .map(\.key)
+        staleKeys.forEach { rawConfigCache.removeValue(forKey: $0) }
     }
     
     private static func uniqueUrlsInOrder(_ urls: [String]) -> [String] {
@@ -457,7 +521,7 @@ class ApiConfig: ObservableObject {
     /// 返回 nil 表示不是多仓库入口；返回数组表示是多仓库入口（数组可能为空）。
     func fetchMultiRepoOptions(from apiUrl: String) async throws -> [MultiRepoOption]? {
         let normalizedUrl = Self.normalizeConfigUrl(apiUrl)
-        let jsonStr = try await network.getString(from: normalizedUrl)
+        let jsonStr = try await fetchConfigText(from: normalizedUrl)
         let cleanedJson = Self.stripJsonComments(jsonStr)
         
         guard let data = cleanedJson.data(using: .utf8) else {
@@ -506,8 +570,11 @@ class ApiConfig: ObservableObject {
         _ config: AppConfigData,
         apiUrl: String,
         includeSources: Bool,
-        includeLive: Bool
-    ) {
+        includeLive: Bool,
+        loadToken: UUID
+    ) async {
+        guard activeLoadToken == loadToken else { return }
+        
         if includeSources {
             // 解析站点列表
             var sources: [SourceBean] = []
@@ -543,6 +610,8 @@ class ApiConfig: ObservableObject {
                 self.parseBeanList = parses.map { p in
                     ParseBean(name: p.name ?? "", url: p.url ?? "", type: p.type?.value ?? 0)
                 }
+            } else {
+                self.parseBeanList = []
             }
             
             // 解析 DoH 列表
@@ -551,6 +620,8 @@ class ApiConfig: ObservableObject {
                     guard let name = d.name, let url = d.url else { return nil }
                     return (name: name, url: url)
                 }
+            } else {
+                self.dohList = []
             }
             
             // 壁纸
@@ -559,7 +630,9 @@ class ApiConfig: ObservableObject {
         
         if includeLive {
             if let lives = config.lives {
-                parseLives(lives, apiUrl: apiUrl)
+                let parsedGroups = await parseLives(lives, apiUrl: apiUrl, loadToken: loadToken)
+                guard activeLoadToken == loadToken else { return }
+                liveChannelGroupList = parsedGroups
             } else {
                 liveChannelGroupList = []
             }
@@ -567,32 +640,65 @@ class ApiConfig: ObservableObject {
     }
     
     /// 解析直播列表
-    private func parseLives(_ lives: [AppConfigData.LiveConfig], apiUrl: String) {
-        Task {
-            var mergedGroups: [String: LiveChannelGroup] = [:]
+    private func parseLives(
+        _ lives: [AppConfigData.LiveConfig],
+        apiUrl: String,
+        loadToken: UUID
+    ) async -> [LiveChannelGroup] {
+        var mergedGroups: [String: LiveChannelGroup] = [:]
+        var remoteLiveTargets: [(order: Int, url: String)] = []
+        
+        for (index, live) in lives.enumerated() {
+            guard activeLoadToken == loadToken else { return [] }
             
-            for live in lives {
-                // 如果有 url，从远程加载
-                if let liveUrl = live.url, !liveUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    let resolvedUrl = resolveLiveUrl(liveUrl, baseConfigUrl: apiUrl)
-                    do {
-                        let content = try await network.getString(from: resolvedUrl)
-                        let groups = parseLiveContent(content)
-                        mergeLiveGroups(groups, into: &mergedGroups)
-                    } catch {
-                        print("加载直播源失败: \(resolvedUrl), error: \(error)")
+            // 如果有 url，从远程加载
+            if let liveUrl = live.url, !liveUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let resolvedUrl = resolveLiveUrl(liveUrl, baseConfigUrl: apiUrl)
+                remoteLiveTargets.append((order: index, url: resolvedUrl))
+            }
+            
+            // 如果有内嵌频道
+            if let channels = live.channels {
+                let inlineGroups = parseInlineLiveChannels(channels)
+                mergeLiveGroups(inlineGroups, into: &mergedGroups)
+            }
+        }
+        
+        if !remoteLiveTargets.isEmpty {
+            let fetchedContents = await withTaskGroup(
+                of: (Int, String?).self,
+                returning: [(Int, String)].self
+            ) { group in
+                for target in remoteLiveTargets {
+                    group.addTask {
+                        do {
+                            let content = try await NetworkManager.shared.getString(from: target.url)
+                            return (target.order, content)
+                        } catch {
+                            print("加载直播源失败: \(target.url), error: \(error)")
+                            return (target.order, nil)
+                        }
                     }
                 }
                 
-                // 如果有内嵌频道
-                if let channels = live.channels {
-                    let inlineGroups = parseInlineLiveChannels(channels)
-                    mergeLiveGroups(inlineGroups, into: &mergedGroups)
+                var results: [(Int, String)] = []
+                for await (order, content) in group {
+                    if let content {
+                        results.append((order, content))
+                    }
                 }
+                return results
             }
             
-            self.liveChannelGroupList = sortedGroups(from: mergedGroups)
+            for (_, content) in fetchedContents.sorted(by: { $0.0 < $1.0 }) {
+                guard activeLoadToken == loadToken else { return [] }
+                let groups = parseLiveContent(content)
+                mergeLiveGroups(groups, into: &mergedGroups)
+                liveChannelGroupList = sortedGroups(from: mergedGroups)
+            }
         }
+        
+        return sortedGroups(from: mergedGroups)
     }
     
     /// 解析 m3u / txt 格式的直播内容

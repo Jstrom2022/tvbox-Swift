@@ -38,7 +38,11 @@ struct HistoryView: View {
                                 .contextMenu {
                                     Button(role: .destructive) {
                                         modelContext.delete(item)
-                                        try? modelContext.save()
+                                        do {
+                                            try modelContext.save()
+                                        } catch {
+                                            print("删除历史记录失败: \(error)")
+                                        }
                                     } label: {
                                         Label("删除记录", systemImage: "trash")
                                     }

@@ -38,7 +38,11 @@ struct FavoritesView: View {
                                 .contextMenu {
                                     Button(role: .destructive) {
                                         modelContext.delete(item)
-                                        try? modelContext.save()
+                                        do {
+                                            try modelContext.save()
+                                        } catch {
+                                            print("删除收藏失败: \(error)")
+                                        }
                                     } label: {
                                         Label("取消收藏", systemImage: "heart.slash")
                                     }

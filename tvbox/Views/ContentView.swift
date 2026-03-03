@@ -289,6 +289,7 @@ struct ContentView: View {
                             .clipShape(Capsule())
                             .shadow(color: .red.opacity(0.4), radius: 12, x: 0, y: 6)
                         }
+                        .buttonStyle(.plain)
                         .disabled(
                             settingsVM.isLoadingConfig
                             || settingsVM.vodApiUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
