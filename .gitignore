@@ -9,3 +9,6 @@ DerivedData/
 /build
 TVBox-*.dmg
 *.py
+/IOS-key
+/TVBox.ipa
+/ExportOptions.plist

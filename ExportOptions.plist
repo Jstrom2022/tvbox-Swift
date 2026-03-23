@@ -3,13 +3,18 @@
 <plist version="1.0">
 <dict>
     <key>method</key>
-    <string>development</string> <!-- 可选: ad-hoc, enterprise, app-store, development -->
+    <string>enterprise</string>
     <key>signingStyle</key>
-    <string>automatic</string>
+    <string>manual</string>
     <key>stripSwiftSymbols</key>
     <true/>
     <key>teamID</key>
-    <string></string> <!-- 此处填写您的 Apple Team ID -->
+    <string>ZDV8SQG3XZ</string> 
+    <key>provisioningProfiles</key>
+    <dict>
+        <key>xyz.appinstall.nov.carbon.lam</key>
+        <string>CarbonLAM_Dist_Jan262026</string>
+    </dict>
     <key>thinning</key>
     <string>&lt;none&gt;</string>
 </dict>
