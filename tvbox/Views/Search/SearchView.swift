@@ -213,6 +213,12 @@ struct FlowLayout: Layout {
     
     /// 核心排版算法：按最大宽度逐个放置，超宽后自动换行。
     private func arrangement(proposal: ProposedViewSize, subviews: Subviews) -> (size: CGSize, positions: [CGPoint]) {
+        // 宽度为 0 是 SwiftUI 在探测最小尺寸（如 macOS 计算窗口最小高度）。
+        // 若照常排版，会把每个子视图各排一行，得到极大的"最小高度"，导致窗口无法拖小；
+        // 这里声明可压缩到 0，实际布局时会以真实宽度重新计算。
+        if let width = proposal.width, width <= 0 {
+            return (.zero, Array(repeating: .zero, count: subviews.count))
+        }
         let maxWidth = proposal.width ?? .infinity
         var positions: [CGPoint] = []
         var currentX: CGFloat = 0

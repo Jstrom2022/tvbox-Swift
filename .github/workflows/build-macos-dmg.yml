@@ -1,0 +1,68 @@
+name: Build macOS DMG
+
+on:
+  push:
+    branches: [main, "feature/**"]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "架构"
+        type: choice
+        options: [universal, arm64, x86_64]
+        default: universal
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 选择最新 Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_*.app | grep -iv beta | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          xcodebuild -list -project tvbox.xcodeproj
+
+      - name: 缓存 SwiftPM 依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/DerivedData/SourcePackages
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-${{ runner.os }}-${{ hashFiles('tvbox.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      - name: 构建并打包 DMG
+        env:
+          # 构建号 = Actions 运行序号；v* tag 时版本号取 tag（v1.0.5 → 1.0.5），否则用工程里的 MARKETING_VERSION
+          BUILD_NUMBER: ${{ github.run_number }}
+          APP_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: |
+          APP_VERSION="${APP_VERSION#v}" ./build_dmg.sh --arch "${{ inputs.arch || 'universal' }}"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: TVBox-macOS-dmg
+          path: dist/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 发布到 Release（仅 v* tag）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.dmg
+          generate_release_notes: true

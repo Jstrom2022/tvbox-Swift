@@ -696,7 +696,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.4;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tvbox.app.macos;
 				PRODUCT_NAME = TVBox;
 				SDKROOT = macosx;
@@ -777,7 +777,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.4;
 				PRODUCT_BUNDLE_IDENTIFIER = com.tvbox.app.macos;
 				PRODUCT_NAME = TVBox;
 				SDKROOT = macosx;
@@ -863,7 +863,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.4;
 				PRODUCT_BUNDLE_IDENTIFIER = xyz.appinstall.nov.carbon.lam;
 				PRODUCT_NAME = TVBox;
 				SDKROOT = iphoneos;
@@ -976,7 +976,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.4;
 				PRODUCT_BUNDLE_IDENTIFIER = xyz.appinstall.nov.carbon.lam;
 				PRODUCT_NAME = TVBox;
 				SDKROOT = iphoneos;

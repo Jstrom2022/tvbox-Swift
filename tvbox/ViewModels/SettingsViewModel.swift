@@ -1,6 +1,151 @@
 import Foundation
 import SwiftUI
 
+// MARK: - 点播订阅（多点播地址）
+
+/// 一条点播订阅：名称 + 配置地址。
+struct VodSubscription: Codable, Identifiable, Hashable {
+    var id: String = UUID().uuidString
+    var name: String
+    var url: String
+
+    /// 未命名时用地址的域名作为默认名称。
+    static func defaultName(for url: String) -> String {
+        let host = URLComponents(string: url.trimmingCharacters(in: .whitespacesAndNewlines))?.host
+        return (host?.isEmpty == false ? host : nil) ?? "未命名订阅"
+    }
+}
+
+/// 点播订阅管理：保存多个点播配置地址，并在它们之间切换（对应影视仓的多仓订阅）。
+/// 设置页与首页共用同一份数据。
+@MainActor
+final class VodSubscriptionStore: ObservableObject {
+    static let shared = VodSubscriptionStore()
+
+    private static let storageKey = "vod_subscriptions"
+
+    /// 全部订阅（按添加顺序）。
+    @Published private(set) var subscriptions: [VodSubscription] = []
+    /// 正在切换中的订阅 id（用于 UI 显示加载状态）。
+    @Published private(set) var switchingId: String?
+    /// 最近一次切换失败的提示。
+    @Published var lastError: String?
+
+    private init() {
+        load()
+    }
+
+    /// 当前生效的订阅：以已保存的点播地址为准。
+    var active: VodSubscription? {
+        let current = ApiConfig.normalizeConfigUrl(UserDefaults.standard.string(forKey: HawkConfig.API_URL) ?? "")
+        guard !current.isEmpty else { return nil }
+        return subscriptions.first { ApiConfig.normalizeConfigUrl($0.url) == current }
+    }
+
+    func isActive(_ subscription: VodSubscription) -> Bool {
+        active?.id == subscription.id
+    }
+
+    /// 新增或更新订阅（同一地址只保留一条）。name 为空时保留原名或用域名。
+    @discardableResult
+    func upsert(url: String, name: String? = nil) -> VodSubscription {
+        let trimmedUrl = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedName = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let normalized = ApiConfig.normalizeConfigUrl(trimmedUrl)
+        // active 依赖已保存的点播地址，命中已有订阅时也通知 UI 刷新勾选状态
+        objectWillChange.send()
+
+        if let index = subscriptions.firstIndex(where: { ApiConfig.normalizeConfigUrl($0.url) == normalized }) {
+            if !trimmedName.isEmpty {
+                subscriptions[index].name = trimmedName
+                save()
+            }
+            return subscriptions[index]
+        }
+
+        let subscription = VodSubscription(
+            name: trimmedName.isEmpty ? VodSubscription.defaultName(for: trimmedUrl) : trimmedName,
+            url: trimmedUrl
+        )
+        subscriptions.append(subscription)
+        save()
+        return subscription
+    }
+
+    func rename(_ subscription: VodSubscription, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let index = subscriptions.firstIndex(where: { $0.id == subscription.id }) else { return }
+        subscriptions[index].name = trimmed
+        save()
+    }
+
+    /// 删除订阅（不影响当前已加载的配置）。
+    func remove(_ subscription: VodSubscription) {
+        subscriptions.removeAll { $0.id == subscription.id }
+        save()
+    }
+
+    /// 添加地址：多仓库入口会展开为多条订阅，普通地址添加为一条。
+    /// - Returns: 新增/命中的订阅列表（第一条可用于立即切换）。
+    func add(url: String, name: String?) async throws -> [VodSubscription] {
+        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw ConfigError.parseError("请输入点播接口地址") }
+
+        if let options = try await ApiConfig.shared.fetchMultiRepoOptions(from: trimmed) {
+            guard !options.isEmpty else { throw ConfigError.parseError("多仓库配置中没有可用地址") }
+            return options.map { upsert(url: $0.url, name: $0.name) }
+        }
+        return [upsert(url: trimmed, name: name)]
+    }
+
+    /// 切换到指定订阅：加载配置成功后才保存为当前点播地址。
+    /// 直播地址若未单独设置则跟随点播。
+    func activate(_ subscription: VodSubscription, appState: AppState) async -> Bool {
+        switchingId = subscription.id
+        lastError = nil
+        defer { switchingId = nil }
+
+        let defaults = UserDefaults.standard
+        let savedLive = (defaults.string(forKey: HawkConfig.LIVE_API_URL) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try await ApiConfig.shared.loadConfigs(
+                vodApiUrl: subscription.url,
+                liveApiUrl: savedLive.isEmpty ? subscription.url : savedLive
+            )
+            defaults.set(subscription.url, forKey: HawkConfig.API_URL)
+            appState.applyLoadedConfigState()
+            objectWillChange.send()
+            return true
+        } catch {
+            if !(error is CancellationError) {
+                lastError = "切换「\(subscription.name)」失败：\(error.localizedDescription)"
+            }
+            return false
+        }
+    }
+
+    private func load() {
+        let defaults = UserDefaults.standard
+        if let data = defaults.data(forKey: Self.storageKey),
+           let decoded = try? JSONDecoder().decode([VodSubscription].self, from: data) {
+            subscriptions = decoded
+        }
+        // 兼容旧版本：只保存过单个点播地址时，迁移为第一条订阅。
+        let legacy = (defaults.string(forKey: HawkConfig.API_URL) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !legacy.isEmpty {
+            upsert(url: legacy)
+        }
+    }
+
+    private func save() {
+        if let data = try? JSONEncoder().encode(subscriptions) {
+            UserDefaults.standard.set(data, forKey: Self.storageKey)
+        }
+    }
+}
+
 /// 设置 ViewModel
 @MainActor
 class SettingsViewModel: ObservableObject {
@@ -141,6 +286,8 @@ class SettingsViewModel: ObservableObject {
             UserDefaults.standard.set(trimmedLive, forKey: HawkConfig.LIVE_API_URL)
             vodApiUrl = trimmedVod
             liveApiUrl = trimmedLive
+            // 手动输入并加载成功的点播地址同步进订阅列表
+            VodSubscriptionStore.shared.upsert(url: trimmedVod)
             addToApiHistory(trimmedVod)
             addToApiHistory(resolvedLive)
             configSuccess = true
@@ -151,6 +298,13 @@ class SettingsViewModel: ObservableObject {
         isLoadingConfig = false
     }
     
+    /// 从持久化重新读取点播/直播地址（订阅在别处切换后保持一致，避免编辑直播地址时把点播地址改回旧值）。
+    func syncSavedUrls() {
+        let defaults = UserDefaults.standard
+        vodApiUrl = defaults.string(forKey: HawkConfig.API_URL) ?? ""
+        liveApiUrl = defaults.string(forKey: HawkConfig.LIVE_API_URL) ?? ""
+    }
+
     /// 处理多仓库弹窗选择结果，并继续走统一加载流程。
     func selectPendingMultiRepoOption(_ option: ApiConfig.MultiRepoOption) async {
         guard let pending = pendingMultiRepoSelection else { return }

@@ -77,6 +77,28 @@ class NetworkManager {
         return str
     }
     
+    /// GET 请求获取字符串，同时返回跟随重定向后的最终地址
+    /// （解析 m3u8 内的相对路径时必须以最终地址为基准）。
+    func getStringWithFinalURL(
+        from urlString: String,
+        headers: [String: String]? = nil,
+        maxRetries: Int = NetworkManager.defaultMaxRetries
+    ) async throws -> (text: String, finalURL: URL) {
+        guard let url = URL(string: urlString.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            throw NetworkError.invalidURL(urlString)
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        headers?.forEach { request.setValue($1, forHTTPHeaderField: $0) }
+
+        let (data, httpResponse) = try await performRequest(request, maxRetries: maxRetries)
+        guard let str = Self.decodeString(data: data, response: httpResponse) else {
+            throw NetworkError.decodingError("文本解码失败")
+        }
+        return (str, httpResponse.url ?? url)
+    }
+
     /// GET 请求解码 JSON，支持自动重试。
     func getJSON<T: Decodable>(
         from urlString: String,

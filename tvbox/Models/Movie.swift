@@ -43,7 +43,11 @@ struct Movie: Codable {
         var last: String = ""
         /// 播放来源信息（部分接口会复用该字段）。
         var dt: String = ""
-        
+        /// 评分（优先豆瓣评分 `vod_douban_score`，其次站内评分 `vod_score`），用于排序。
+        var score: Double = 0
+        /// 热度/点击数（`vod_hits`），用于"热门"排序。
+        var hits: Int = 0
+
         init(id: String = UUID().uuidString, name: String = "", pic: String = "",
              note: String = "", sourceKey: String = "") {
             self.id = id
@@ -68,6 +72,39 @@ struct Movie: Codable {
             case last = "vod_time"
             case dt = "vod_play_from"
             case sourceKey
+            case score = "vod_score"
+            case doubanScore = "vod_douban_score"
+            case hits = "vod_hits"
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(id, forKey: .id)
+            try container.encode(name, forKey: .name)
+            try container.encode(pic, forKey: .pic)
+            try container.encode(note, forKey: .note)
+            try container.encode(year, forKey: .year)
+            try container.encode(area, forKey: .area)
+            try container.encode(type, forKey: .type)
+            try container.encode(director, forKey: .director)
+            try container.encode(actor, forKey: .actor)
+            try container.encode(des, forKey: .des)
+            try container.encode(tid, forKey: .tid)
+            try container.encode(last, forKey: .last)
+            try container.encode(dt, forKey: .dt)
+            try container.encode(sourceKey, forKey: .sourceKey)
+            try container.encode(score, forKey: .score)
+            try container.encode(hits, forKey: .hits)
+        }
+
+        /// 兼容数字/字符串两种形态的数值字段（如 `"8.5"`、`8.5`、`"1234"`）。
+        private static func decodeLossyDouble(_ container: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys) -> Double {
+            if let value = try? container.decode(Double.self, forKey: key) { return value }
+            if let text = try? container.decode(String.self, forKey: key),
+               let value = Double(text.trimmingCharacters(in: .whitespaces)) {
+                return value
+            }
+            return 0
         }
         
         /// 自定义解码以兼容多源字段类型差异（如 `vod_id` / `type_id` 可能是 Int 或 String）。
@@ -97,6 +134,9 @@ struct Movie: Codable {
             self.last = (try? container.decode(String.self, forKey: .last)) ?? ""
             self.dt = (try? container.decode(String.self, forKey: .dt)) ?? ""
             self.sourceKey = (try? container.decode(String.self, forKey: .sourceKey)) ?? ""
+            let doubanScore = Self.decodeLossyDouble(container, .doubanScore)
+            self.score = doubanScore > 0 ? doubanScore : Self.decodeLossyDouble(container, .score)
+            self.hits = Int(Self.decodeLossyDouble(container, .hits))
         }
     }
 }

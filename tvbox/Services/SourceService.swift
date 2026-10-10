@@ -124,6 +124,15 @@ class SourceService {
                         sorts.append(MovieSort.SortData(id: id, name: name))
                     }
                 }
+
+                // 解析分类筛选条件：{"<type_id>": [{"key","name","value":[{"n","v"}]}]}
+                if let filterMap = json["filters"] as? [String: Any] {
+                    for index in sorts.indices {
+                        if let rawFilters = filterMap[sorts[index].id] as? [[String: Any]] {
+                            sorts[index].filters = parseFilters(rawFilters)
+                        }
+                    }
+                }
                 
                 // 解析首页推荐视频
                 if let list = json["list"] as? [[String: Any]] {
@@ -142,6 +151,29 @@ class SourceService {
         return (sorts, homeVideos)
     }
     
+    private func parseFilters(_ rawFilters: [[String: Any]]) -> [MovieSort.SortFilter] {
+        rawFilters.compactMap { raw in
+            guard let key = raw["key"] as? String, !key.isEmpty,
+                  let rawValues = raw["value"] as? [[String: Any]] else { return nil }
+            let values = rawValues.map { item in
+                MovieSort.SortFilter.SortFilterValue(
+                    n: Self.lossyString(item["n"]),
+                    v: Self.lossyString(item["v"])
+                )
+            }
+            guard !values.isEmpty else { return nil }
+            return MovieSort.SortFilter(key: key, name: Self.lossyString(raw["name"]), values: values)
+        }
+    }
+
+    private static func lossyString(_ value: Any?) -> String {
+        switch value {
+        case let text as String: return text
+        case let number as NSNumber: return number.stringValue
+        default: return ""
+        }
+    }
+
     private func parseXMLCategories(from xml: String) -> [MovieSort.SortData] {
         // 简化的 XML 分类解析
         var sorts: [MovieSort.SortData] = []
@@ -168,7 +200,12 @@ class SourceService {
         guard !api.isEmpty else { throw SourceError.emptyApi }
         guard sourceBean.isSupportedInSwift else { throw SourceError.unsupportedType(sourceBean.typeDescription) }
         guard sourceBean.isHttpApi else { throw SourceError.invalidApiUrl(api) }
-        
+
+        // 本地筛选条件（年份/排序兜底）只在客户端生效，空值表示"全部"，都不传给接口。
+        let filters = filters?.filter { key, value in
+            !key.hasPrefix(MovieSort.SortFilter.localKeyPrefix) && !value.isEmpty
+        }
+
         let url: String
         if sourceBean.type == 0 {
             // XML 接口
@@ -219,7 +256,7 @@ class SourceService {
             
             // 附加筛选参数
             if let filters = filters {
-                for (key, value) in filters {
+                for (key, value) in filters.sorted(by: { $0.key < $1.key }) {
                     queryItems.append(URLQueryItem(name: key, value: value))
                 }
             }
@@ -460,6 +497,94 @@ class SourceService {
         return String(String.UnicodeScalarView(scalars)).lowercased()
     }
     
+    // MARK: - 豆瓣片库
+
+    /// 豆瓣条目的 sourceKey 标记：这类条目不能直接播放，需按片名全源搜索。
+    static let doubanSourceKey = "douban"
+
+    private static let doubanHeaders = [
+        "Referer": "https://movie.douban.com/",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    ]
+
+    /// 获取豆瓣片库列表（m.douban.com rexxar 推荐接口，支持排序与年份/地区标签）。
+    /// - Parameters:
+    ///   - kind: movie 电影 / tv 电视剧 / show 综艺
+    ///   - sort: T 综合 / U 近期热度 / S 高分优先 / R 首映时间
+    ///   - tags: 年份、地区等标签，如 ["2024", "华语"]
+    func getDoubanList(kind: String, sort: String, tags: [String], page: Int, pageSize: Int = 30) async throws -> [Movie.Video] {
+        let path: String
+        var categories: [String: String] = [:]
+        switch kind {
+        case "tv":
+            path = "tv"
+            categories["形式"] = "电视剧"
+        case "show":
+            path = "tv"
+            categories["形式"] = "综艺"
+        default:
+            path = "movie"
+        }
+
+        let categoryData = try JSONSerialization.data(withJSONObject: categories, options: [.sortedKeys])
+        let categoryJSON = String(data: categoryData, encoding: .utf8) ?? "{}"
+        var queryItems = [
+            URLQueryItem(name: "refresh", value: "0"),
+            URLQueryItem(name: "start", value: String(max(0, page - 1) * pageSize)),
+            URLQueryItem(name: "count", value: String(pageSize)),
+            URLQueryItem(name: "selected_categories", value: categoryJSON),
+            URLQueryItem(name: "uncollect", value: "false"),
+            URLQueryItem(name: "sort", value: sort.isEmpty ? "T" : sort)
+        ]
+        let tagValue = tags.filter { !$0.isEmpty }.joined(separator: ",")
+        if !tagValue.isEmpty {
+            queryItems.append(URLQueryItem(name: "tags", value: tagValue))
+        }
+
+        let url = try buildURL(base: "https://m.douban.com/rexxar/api/v2/\(path)/recommend", queryItems: queryItems)
+        let jsonStr = try await network.getString(from: url, headers: Self.doubanHeaders)
+        return try parseDoubanList(jsonStr)
+    }
+
+    private func parseDoubanList(_ jsonStr: String) throws -> [Movie.Video] {
+        guard let data = jsonStr.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw SourceError.parseError("豆瓣数据格式异常")
+        }
+        guard let items = json["items"] as? [[String: Any]] else {
+            // 豆瓣风控时会返回 {"msg": ..., "code": ...}
+            let message = json["localized_message"] as? String ?? json["msg"] as? String ?? "豆瓣数据格式异常"
+            throw SourceError.parseError(message)
+        }
+
+        return items.compactMap { item in
+            // 列表中夹杂广告/专题卡片，只保留影视条目
+            let itemType = item["type"] as? String ?? ""
+            guard itemType == "movie" || itemType == "tv",
+                  let doubanId = item["id"] as? String,
+                  let title = item["title"] as? String, !title.isEmpty else { return nil }
+
+            var video = Movie.Video(id: "douban_\(doubanId)", name: title, sourceKey: Self.doubanSourceKey)
+            if let pic = item["pic"] as? [String: Any] {
+                video.pic = pic["normal"] as? String ?? pic["large"] as? String ?? ""
+            }
+            if let rating = item["rating"] as? [String: Any],
+               let value = (rating["value"] as? NSNumber)?.doubleValue, value > 0 {
+                video.score = value
+                video.note = String(format: "豆瓣 %.1f", value)
+            } else {
+                video.note = item["episodes_info"] as? String ?? ""
+            }
+            // card_subtitle 形如 "2024 / 中国大陆 / 剧情 古装 / 导演 / 主演"
+            let subtitle = (item["card_subtitle"] as? String ?? "")
+                .components(separatedBy: " / ")
+            video.year = subtitle.first ?? ""
+            video.area = subtitle.count > 1 ? subtitle[1] : ""
+            video.type = [video.year, video.area].filter { !$0.isEmpty }.joined(separator: " · ")
+            return video
+        }
+    }
+
     // MARK: - Extend 解析
     
     /// 解析 extend 参数（对应 Android 端 getFixUrl）

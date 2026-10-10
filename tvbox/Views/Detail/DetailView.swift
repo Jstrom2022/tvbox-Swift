@@ -45,8 +45,32 @@ struct DetailView: View {
                         .onTapGesture(count: 2) {
                             openFullScreenPlayer()
                         }
+                } else if !showFullScreen, viewModel.isPlaying, viewModel.playUrl == nil, viewModel.isPreparingPlayback {
+                    // 首次播放时正在解析地址或去广告：先占住播放器位置，避免布局跳动
+                    ZStack {
+                        Color.black
+                        VStack(spacing: 10) {
+                            ProgressView().tint(.orange)
+                            Text("正在准备播放…")
+                                .font(.caption)
+                                .foregroundColor(.white.opacity(0.6))
+                        }
+                    }
+                    .aspectRatio(16/9, contentMode: .fit)
                 }
-                
+
+                if let note = viewModel.adFilterNote, viewModel.isPlaying {
+                    HStack(spacing: 6) {
+                        Image(systemName: "shield.checkered")
+                        Text(note)
+                    }
+                    .font(.caption)
+                    .foregroundColor(.green.opacity(0.85))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 8)
+                }
+
                 // 视频信息
                 videoInfoSection
                     .padding(.horizontal, 20)
@@ -492,6 +516,8 @@ struct DetailView: View {
     }
     
     private func handlePlaybackProgress(_ seconds: Double, _: Double?) {
+        // 切集后正在去广告时，回调来自上一集的播放器，不能记到新剧集的历史里
+        guard !viewModel.isPreparingPlayback else { return }
         viewModel.updatePlaybackProgress(seconds: seconds)
         persistHistoryIfNeeded(force: false, currentProgress: seconds)
     }
