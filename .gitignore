@@ -15,3 +15,4 @@ TVBox-*.dmg
 .kiro
 package_ios.sh
 image_cache
+/dist

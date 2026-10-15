@@ -23,6 +23,9 @@ struct SettingsView: View {
     
     @StateObject private var viewModel = SettingsViewModel()
     @StateObject private var apiConfig = ApiConfig.shared
+    @ObservedObject private var subscriptionStore = VodSubscriptionStore.shared
+    /// 点播 m3u8 去广告开关（默认开启，与 HLSAdFilter.isEnabled 同一个 key）
+    @AppStorage(HLSAdFilter.enabledKey) private var adFilterEnabled = true
     @EnvironmentObject var appState: AppState
     @State private var showApiInput = false
     @State private var editingApiType: ApiInputType = .vod
@@ -45,13 +48,15 @@ struct SettingsView: View {
                 VStack(spacing: 24) {
                     // API 配置
                     SectionCard(title: "数据源") {
-                        SettingsRow(
-                            icon: "film",
-                            title: "点播接口地址",
-                            value: viewModel.vodApiUrl.isEmpty ? "未配置" : viewModel.vodApiUrl
-                        ) {
-                            editingApiType = .vod
-                            showApiInput = true
+                        NavigationLink {
+                            VodSubscriptionListView(onSwitched: viewModel.syncSavedUrls)
+                        } label: {
+                            SettingsRow(
+                                icon: "film",
+                                title: "点播订阅",
+                                value: subscriptionSummary,
+                                action: nil
+                            )
                         }
                         Divider().background(Color.white.opacity(0.1))
                         SettingsRow(
@@ -99,6 +104,10 @@ struct SettingsView: View {
                         SettingsRow(icon: "forward", title: "快进步长", value: "\(viewModel.playTimeStep)秒") {
                             showingPicker = .playTimeStep
                         }
+                        Divider().background(Color.white.opacity(0.1))
+                        SettingsRow(icon: "shield.checkered", title: "广告过滤", value: adFilterEnabled ? "开启" : "关闭") {
+                            adFilterEnabled.toggle()
+                        }
                     }
                     
                     // 功能
@@ -125,7 +134,7 @@ struct SettingsView: View {
                     
                     // 关于
                     SectionCard(title: "关于") {
-                        SettingsRow(icon: "info.circle", title: "版本", value: "1.0.0", action: nil)
+                        SettingsRow(icon: "info.circle", title: "版本", value: appVersionText, action: nil)
                         Divider().background(Color.white.opacity(0.1))
                         SettingsRow(icon: "globe", title: "站点数量", value: "\(apiConfig.sourceBeanList.count)", action: nil)
                         Divider().background(Color.white.opacity(0.1))
@@ -144,6 +153,9 @@ struct SettingsView: View {
             .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbarBackground(.hidden, for: .navigationBar)
             #endif
+            .onAppear {
+                viewModel.syncSavedUrls()
+            }
             .sheet(isPresented: $showApiInput) {
                 apiInputSheet
             }
@@ -382,7 +394,15 @@ struct SettingsView: View {
         NSPasteboard.general.string(forType: .string)
         #endif
     }
-    
+
+    /// 「点播订阅」行右侧摘要：当前订阅名 + 总数。
+    private var subscriptionSummary: String {
+        let count = subscriptionStore.subscriptions.count
+        guard count > 0 else { return "未配置" }
+        let name = subscriptionStore.active?.name ?? "未选择"
+        return count > 1 ? "\(name)（共\(count)个）" : name
+    }
+
     // MARK: - 源选择
     
     private var filteredSources: [SourceBean] {
@@ -524,6 +544,14 @@ struct SectionCard<Content: View>: View {
     }
 }
 
+/// 当前 App 版本，形如 "1.0.4 (12)"（版本号 + 构建号）。
+private var appVersionText: String {
+    let info = Bundle.main.infoDictionary
+    let version = info?["CFBundleShortVersionString"] as? String ?? "-"
+    let build = info?["CFBundleVersion"] as? String ?? ""
+    return build.isEmpty ? version : "\(version) (\(build))"
+}
+
 struct SettingsRow: View {
     let icon: String
     let title: String
@@ -568,5 +596,307 @@ struct SettingsRow: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
         .contentShape(Rectangle())
+    }
+}
+
+// MARK: - 点播订阅管理
+
+/// 点播订阅列表：切换 / 添加 / 改名 / 删除多个点播配置地址。
+struct VodSubscriptionListView: View {
+    /// 切换成功后的回调（设置页据此同步输入框里的地址）。
+    var onSwitched: (() -> Void)? = nil
+
+    @ObservedObject private var store = VodSubscriptionStore.shared
+    @EnvironmentObject var appState: AppState
+
+    @State private var showAddSheet = false
+    @State private var newName = ""
+    @State private var newUrl = ""
+    @State private var isAdding = false
+    @State private var addError: String?
+    @State private var renaming: VodSubscription?
+    @State private var renameText = ""
+    @State private var pendingDelete: VodSubscription?
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                if let error = store.lastError {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 8)
+                }
+
+                if store.subscriptions.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "tray")
+                            .font(.largeTitle)
+                            .foregroundColor(.gray)
+                        Text("还没有点播订阅，点右上角「添加」")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.top, 60)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(Array(store.subscriptions.enumerated()), id: \.element.id) { index, subscription in
+                            if index > 0 {
+                                Divider().background(Color.white.opacity(0.1))
+                            }
+                            subscriptionRow(subscription)
+                        }
+                    }
+                    .glassCard(cornerRadius: 16)
+
+                    Text("点一行即切换到该订阅；多仓库地址添加后会自动展开为多条。")
+                        .font(.caption)
+                        .foregroundColor(.white.opacity(0.4))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 8)
+                }
+            }
+            .padding(20)
+        }
+        .background(AppTheme.primaryGradient.ignoresSafeArea())
+        .navigationTitle("点播订阅")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    newName = ""
+                    newUrl = ""
+                    addError = nil
+                    showAddSheet = true
+                } label: {
+                    Label("添加", systemImage: "plus")
+                }
+            }
+        }
+        .sheet(isPresented: $showAddSheet) {
+            addSheet
+        }
+        .alert("重命名订阅", isPresented: Binding(
+            get: { renaming != nil },
+            set: { if !$0 { renaming = nil } }
+        )) {
+            TextField("名称", text: $renameText)
+            Button("取消", role: .cancel) { renaming = nil }
+            Button("保存") {
+                if let target = renaming {
+                    store.rename(target, to: renameText)
+                }
+                renaming = nil
+            }
+        }
+        .confirmationDialog(
+            "删除订阅「\(pendingDelete?.name ?? "")」？",
+            isPresented: Binding(
+                get: { pendingDelete != nil },
+                set: { if !$0 { pendingDelete = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("删除", role: .destructive) {
+                if let target = pendingDelete {
+                    store.remove(target)
+                }
+                pendingDelete = nil
+            }
+            Button("取消", role: .cancel) { pendingDelete = nil }
+        } message: {
+            Text("只从列表移除，不影响当前已加载的内容。")
+        }
+    }
+
+    private func subscriptionRow(_ subscription: VodSubscription) -> some View {
+        let isActive = store.isActive(subscription)
+        return HStack(spacing: 12) {
+            Button {
+                switchTo(subscription)
+            } label: {
+                HStack(spacing: 12) {
+                    Group {
+                        if store.switchingId == subscription.id {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: isActive ? "checkmark.circle.fill" : "circle")
+                                .foregroundColor(isActive ? .orange : .white.opacity(0.3))
+                        }
+                    }
+                    .frame(width: 22)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(subscription.name)
+                            .font(.body.weight(isActive ? .semibold : .regular))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                        Text(subscription.url)
+                            .font(.caption)
+                            .foregroundColor(.white.opacity(0.45))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(store.switchingId != nil)
+
+            Menu {
+                Button {
+                    renameText = subscription.name
+                    renaming = subscription
+                } label: {
+                    Label("重命名", systemImage: "pencil")
+                }
+                Button {
+                    copyToPasteboard(subscription.url)
+                } label: {
+                    Label("复制地址", systemImage: "doc.on.doc")
+                }
+                Button(role: .destructive) {
+                    pendingDelete = subscription
+                } label: {
+                    Label("删除", systemImage: "trash")
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .foregroundColor(.white.opacity(0.6))
+                    .frame(width: 28, height: 28)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    /// 最近输入过、但还不在订阅列表里的地址，方便一键加入。
+    private var historyCandidates: [String] {
+        let saved = Set(store.subscriptions.map { ApiConfig.normalizeConfigUrl($0.url) })
+        return (UserDefaults.standard.stringArray(forKey: "api_history") ?? [])
+            .filter { !saved.contains(ApiConfig.normalizeConfigUrl($0)) }
+    }
+
+    private var addSheet: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 16) {
+                TextField("名称（可留空，默认用域名）", text: $newName)
+                    .textFieldStyle(.plain)
+                    .padding()
+                    .background(Color.secondary.opacity(0.1))
+                    .cornerRadius(10)
+
+                HStack {
+                    Image(systemName: "link").foregroundColor(.secondary)
+                    TextField("点播接口地址（支持多仓库地址）", text: $newUrl)
+                        .textFieldStyle(.plain)
+                        #if os(iOS)
+                        .autocapitalization(.none)
+                        .keyboardType(.URL)
+                        #endif
+                    Button {
+                        if let text = readPasteboard() { newUrl = text }
+                    } label: {
+                        Image(systemName: "doc.on.clipboard")
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding()
+                .background(Color.secondary.opacity(0.1))
+                .cornerRadius(10)
+
+                if !historyCandidates.isEmpty {
+                    Text("最近使用过的地址")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    ForEach(historyCandidates, id: \.self) { url in
+                        Button {
+                            newUrl = url
+                        } label: {
+                            HStack {
+                                Image(systemName: "clock").font(.caption)
+                                Text(url).font(.caption).lineLimit(1)
+                            }
+                            .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                if let addError {
+                    Text(addError).font(.caption).foregroundColor(.red)
+                }
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("添加点播订阅")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { showAddSheet = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button {
+                        Task { await addAndSwitch() }
+                    } label: {
+                        if isAdding { ProgressView() } else { Text("添加并切换") }
+                    }
+                    .disabled(isAdding || newUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        #if os(macOS)
+        .frame(minWidth: 460, minHeight: 320)
+        #endif
+    }
+
+    private func addAndSwitch() async {
+        isAdding = true
+        addError = nil
+        defer { isAdding = false }
+        do {
+            let added = try await store.add(url: newUrl, name: newName)
+            guard let first = added.first else { return }
+            if await store.activate(first, appState: appState) {
+                onSwitched?()
+                showAddSheet = false
+            } else {
+                // 地址已加入列表，但加载失败：留在弹窗里提示，可改地址重试或直接取消
+                addError = store.lastError
+            }
+        } catch {
+            addError = error.localizedDescription
+        }
+    }
+
+    private func switchTo(_ subscription: VodSubscription) {
+        guard !store.isActive(subscription) else { return }
+        Task {
+            if await store.activate(subscription, appState: appState) {
+                onSwitched?()
+            }
+        }
+    }
+
+    private func readPasteboard() -> String? {
+        #if os(iOS)
+        UIPasteboard.general.string
+        #else
+        NSPasteboard.general.string(forType: .string)
+        #endif
+    }
+
+    private func copyToPasteboard(_ text: String) {
+        #if os(iOS)
+        UIPasteboard.general.string = text
+        #else
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #endif
     }
 }
