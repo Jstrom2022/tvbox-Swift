@@ -45,6 +45,17 @@ extension String {
     }
 }
 
+extension Bundle {
+    /// 实际构建产物的版本号（如 “1.0.3 (1)”），设置页与个人中心统一使用。
+    var appVersionDescription: String {
+        let version = infoDictionary?["CFBundleShortVersionString"] as? String ?? "未知"
+        guard let build = infoDictionary?["CFBundleVersion"] as? String, !build.isEmpty else {
+            return version
+        }
+        return "\(version) (\(build))"
+    }
+}
+
 extension Date {
     /// 格式化日期显示
     var displayString: String {

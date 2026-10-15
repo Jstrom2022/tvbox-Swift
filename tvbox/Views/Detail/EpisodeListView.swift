@@ -64,7 +64,7 @@ struct EpisodeListView: View {
                     .padding(.horizontal, 20)
                 }
             }
-            
+
             // 剧集网格：自适应换行，避免横向裁切。
             LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 10) {
                 // 这里使用当前组内索引 + 组偏移，换算成全局索引以便外部状态一致。
@@ -99,6 +99,39 @@ struct EpisodeListView: View {
                 }
             }
             .padding(.horizontal, 20)
+        }
+        // 线路切换后分组数可能变少：钳制分组索引，避免切片为空导致整组不可操作。
+        .onChange(of: episodes.count) { _, _ in
+            clampCurrentGroup()
+        }
+        // 选中集变化（续播定位、自动换集）时，跟随到该集所在分组；用户主动浏览其他分组不受影响。
+        .onChange(of: selectedIndex) { _, _ in
+            revealSelectedGroupIfNeeded()
+        }
+        .onAppear {
+            clampCurrentGroup()
+            revealSelectedGroupIfNeeded()
+        }
+    }
+
+    /// 把分组索引钳制到有效范围内。
+    private func clampCurrentGroup() {
+        let maxGroup = max(0, groupCount - 1)
+        if currentGroup > maxGroup {
+            currentGroup = maxGroup
+        }
+        if currentGroup < 0 {
+            currentGroup = 0
+        }
+    }
+
+    /// 选中集不在当前分组内时切换到它所在的分组。
+    private func revealSelectedGroupIfNeeded() {
+        guard selectedIndex >= 0, selectedIndex < episodes.count else { return }
+        let targetGroup = selectedIndex / groupSize
+        clampCurrentGroup()
+        if currentGroup != targetGroup {
+            currentGroup = min(targetGroup, max(0, groupCount - 1))
         }
     }
 }

@@ -5,85 +5,205 @@ import Combine
 /// 首页 ViewModel
 @MainActor
 class HomeViewModel: ObservableObject {
-    /// 分类列表（包含手动注入的"推荐""豆瓣"分类）。
+    /// 分类列表（包含手动注入的"推荐"分类）。
     @Published var sorts: [MovieSort.SortData] = []
     /// 当前选中的分类。
     @Published var selectedSort: MovieSort.SortData?
     /// 首页推荐内容（对应"推荐"分类）。
     @Published var homeVideos: [Movie.Video] = []
-    /// 普通分类的视频列表（已按本地年份/排序处理，直接用于展示）。
+    /// 普通分类的视频列表（分页加载）。
     @Published private(set) var categoryVideos: [Movie.Video] = []
-    /// 当前分类的筛选选择（key -> 取值），按分类分别记忆。
+    /// 按分类记忆筛选选择；换源时清空，避免沿用其他源的参数。
     @Published private(set) var filterSelections: [String: [String: String]] = [:]
-    /// 页面加载状态（分类加载与分页共用）。
-    @Published var isLoading = false
-    /// 当前分类的分页页码。
-    @Published var currentPage = 1
-    /// 是否还有下一页。
-    @Published var hasMore = true
-    /// 错误提示文案。
-    @Published var errorMessage: String?
-
-    /// 本地筛选生效时，单次加载最多连续追加的页数（避免筛选结果稀疏时请求过多）。
+    private var rawCategoryVideos: [Movie.Video] = []
     private static let maxAutoFillPages = 5
-    /// 本地年份筛选生效时，首屏至少凑够的条目数。
     private static let minFilteredCount = 18
+    /// 推荐分类加载中。
+    @Published private(set) var isLoadingHome = false
+    /// 当前分类首屏加载中。
+    @Published private(set) var isLoadingCategory = false
+    /// 当前分类分页加载中。
+    @Published private(set) var isLoadingMore = false
+    /// 当前分类的分页页码。
+    @Published private(set) var currentPage = 1
+    /// 是否还有下一页。
+    @Published private(set) var hasMore = true
+    /// 推荐分类的错误提示。
+    @Published var homeErrorMessage: String?
+    /// 当前分类首屏的错误提示。
+    @Published var categoryErrorMessage: String?
+    /// 当前分类分页的错误提示。
+    @Published var loadMoreErrorMessage: String?
+    /// 是否已经完成过一次推荐加载（用于区分“尚未加载”与“确实为空”）。
+    @Published private(set) var hasLoadedHome = false
+
+    /// 页面整体加载状态（推荐或当前分类任一在加载）。
+    var isLoading: Bool { isLoadingHome || isLoadingCategory || isLoadingMore }
 
     /// 源数据访问服务。
     private let sourceService = SourceService.shared
-    /// 接口返回的原始列表（未经本地筛选/排序）。
-    private var rawCategoryVideos: [Movie.Video] = []
-    /// 加载代次：切换分类/筛选时递增，用于丢弃过期请求结果。
-    private var loadGeneration = 0
-    /// 正在进行中的分页加载所属代次。
-    private var inFlightGeneration: Int?
     /// 标记上次加载是否因网络错误失败（用于网络恢复自动重试）。
     private var lastLoadFailedDueToNetwork = false
     private var networkRestoredCancellable: AnyCancellable?
+    private var configChangeCancellable: AnyCancellable?
+
+    /// 首页与分类任务各自持有令牌，互不干扰：切换选择时取消对应旧任务。
+    private var homeTask: Task<Void, Never>?
+    private var categoryTask: Task<Void, Never>?
+    private var homeGeneration = 0
+    private var categoryGeneration = 0
+    /// 当前推荐数据所属的来源 key 与配置版本，用于判断是否可以跳过重复加载。
+    private var loadedSourceKey: String?
+    private var loadedConfigVersion = -1
+    /// 最近一次加载所针对的来源与配置版本，用于合并重复的刷新触发。
+    private var requestedSourceKey: String?
+    private var requestedConfigVersion = -1
+    /// 当前分类已收录的视频身份，用于分页去重。
+    private var categoryVideoIds: Set<Movie.Video.Identity> = []
 
     init() {
         setupNetworkRestoredAutoRetry()
+        setupConfigChangeReload()
     }
 
-    /// 加载分类列表
-    func loadSorts() async {
-        guard let source = ApiConfig.shared.homeSourceBean else { return }
-        isLoading = true
-        errorMessage = nil
+    // MARK: - 生命周期
+
+    /// 页面出现时按需加载：来源或配置发生变化、或尚无数据时重新加载。
+    func loadIfNeeded() async {
+        let sourceKey = ApiConfig.shared.homeSourceBean?.key
+        let version = ApiConfig.shared.configVersion
+        if loadedSourceKey == sourceKey, loadedConfigVersion == version, !sorts.isEmpty {
+            return
+        }
+        // 同一来源与配置的加载已经在进行中，等待它完成即可。
+        if let homeTask, requestedSourceKey == sourceKey, requestedConfigVersion == version {
+            await homeTask.value
+            return
+        }
+        await reload(clearContent: loadedSourceKey != nil && loadedSourceKey != sourceKey)
+    }
+
+    /// 刷新（下拉刷新、重试）。
+    func refresh() async {
+        await reload(clearContent: false)
+    }
+
+    /// 切换主页数据源：立即清空旧源内容并加载新源，旧源的迟到结果会被丢弃。
+    func switchSource(_ source: SourceBean) async {
+        guard ApiConfig.shared.homeSourceBean?.key != source.key else { return }
+        ApiConfig.shared.setHomeSource(source)
+        await reload(clearContent: true)
+    }
+
+    /// 全量重新加载分类与当前分类内容。
+    private func reload(clearContent: Bool) async {
+        homeTask?.cancel()
+        categoryTask?.cancel()
+        homeGeneration &+= 1
+        categoryGeneration &+= 1
+        homeTask = nil
+        categoryTask = nil
+
+        isLoadingHome = false
+        isLoadingCategory = false
+        isLoadingMore = false
+        homeErrorMessage = nil
+        categoryErrorMessage = nil
+        loadMoreErrorMessage = nil
+        if clearContent {
+            // 换源或配置变化：旧源的分类、选中项与内容都不再适用。
+            filterSelections = [:]
+            rawCategoryVideos = []
+            sorts = []
+            selectedSort = nil
+            homeVideos = []
+            categoryVideos = []
+            categoryVideoIds = []
+            hasLoadedHome = false
+        }
+        currentPage = 1
+        hasMore = true
+        requestedSourceKey = ApiConfig.shared.homeSourceBean?.key
+        requestedConfigVersion = ApiConfig.shared.configVersion
+
+        let homeGeneration = self.homeGeneration
+        homeTask = Task { [weak self] in
+            await self?.loadHome(generation: homeGeneration)
+        }
+        await homeTask?.value
+    }
+
+    // MARK: - 推荐分类
+
+    private func loadHome(generation: Int) async {
+        guard let source = ApiConfig.shared.homeSourceBean else {
+            homeErrorMessage = "尚未配置可用的数据源"
+            hasLoadedHome = true
+            isLoadingHome = false
+            return
+        }
+
+        let sourceKey = source.key
+        let version = ApiConfig.shared.configVersion
+        isLoadingHome = true
 
         do {
             let result = try await sourceService.getSort(sourceBean: source)
+            guard isHomeResultCurrent(generation: generation, sourceKey: sourceKey) else { return }
 
-            // 插入本地"推荐""豆瓣"分类，保持 UI 与 Android 版本 / 影视仓习惯一致。
             var allSorts = [MovieSort.SortData.home(), MovieSort.SortData.douban()]
             allSorts.append(contentsOf: result.sorts)
-
             self.sorts = allSorts
-            self.homeVideos = result.homeVideos
-            lastLoadFailedDueToNetwork = false
+            self.homeVideos = Self.deduplicated(result.homeVideos)
+            self.homeErrorMessage = nil
+            self.hasLoadedHome = true
+            self.lastLoadFailedDueToNetwork = false
+            self.loadedSourceKey = sourceKey
+            self.loadedConfigVersion = version
 
-            if selectedSort == nil {
-                selectedSort = allSorts.first
-            }
+            applySelectionAfterReload()
         } catch {
-            errorMessage = error.localizedDescription
+            guard isHomeResultCurrent(generation: generation, sourceKey: sourceKey) else { return }
+            self.homeErrorMessage = error.localizedDescription
+            self.hasLoadedHome = true
+            if loadedSourceKey != sourceKey {
+                // 换了数据源却加载失败时，旧源的分类已不再适用。
+                self.sorts = []
+                self.homeVideos = []
+                self.rawCategoryVideos = []
+                self.categoryVideos = []
+                self.categoryVideoIds = []
+                self.selectedSort = nil
+            }
             lastLoadFailedDueToNetwork = error.isNetworkConnectionError
         }
 
-        isLoading = false
+        guard isHomeResultCurrent(generation: generation, sourceKey: sourceKey) else { return }
+        isLoadingHome = false
+        homeTask = nil
     }
 
-    /// 网络恢复时，若上次因网络错误导致首页为空，自动重新加载。
-    private func setupNetworkRestoredAutoRetry() {
-        networkRestoredCancellable = NetworkMonitor.shared.networkRestoredPublisher
-            .sink { [weak self] in
-                guard let self else { return }
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    guard self.lastLoadFailedDueToNetwork || (self.sorts.isEmpty && self.homeVideos.isEmpty) else { return }
-                    await self.refresh()
-                }
+    private func isHomeResultCurrent(generation: Int, sourceKey: String) -> Bool {
+        guard !Task.isCancelled, generation == homeGeneration else { return false }
+        return ApiConfig.shared.homeSourceBean?.key == sourceKey
+    }
+
+    /// 推荐加载完成后校正当前选中的分类：优先保留原分类，分类已不存在时回退到第一个分类，
+    /// 尚未选择时选中“推荐”。
+    private func applySelectionAfterReload() {
+        if let previousId = selectedSort?.id {
+            if let matched = sorts.first(where: { $0.id == previousId }) {
+                selectSort(matched)
+                return
             }
+            if let firstCategory = sorts.first(where: { !$0.isHome && !$0.isDouban }) {
+                selectSort(firstCategory)
+                return
+            }
+        }
+        if let home = sorts.first {
+            selectSort(home)
+        }
     }
 
     // MARK: - 筛选
@@ -116,9 +236,9 @@ class HomeViewModel: ObservableObject {
 
         if filter.isLocal && !sort.isDouban {
             applyLocalFilters()
-            Task { await fillFilteredResultsIfNeeded(sort: sort) }
+            fillFilteredResultsIfNeeded(sort: sort)
         } else {
-            reloadCurrentSort()
+            selectSort(sort)
         }
     }
 
@@ -192,143 +312,236 @@ class HomeViewModel: ObservableObject {
             .map(\.element)
     }
 
-    // MARK: - 分类与分页
+    private func fillFilteredResultsIfNeeded(sort: MovieSort.SortData) {
+        guard selectedSort?.id == sort.id, isLocalYearFilterActive(for: sort), hasMore,
+              categoryVideos.count < Self.minFilteredCount,
+              !isLoadingCategory, !isLoadingMore, loadMoreErrorMessage == nil else { return }
+        startCategoryLoad(page: currentPage + 1, sort: sort, sourceKey: ApiConfig.shared.homeSourceBean?.key)
+    }
+
+    // MARK: - 分类选择
 
     /// 选择分类
     func selectSort(_ sort: MovieSort.SortData) {
-        // 切分类时先重置分页状态，避免旧分类残留数据闪烁。
-        selectedSort = sort
-        reloadCurrentSort()
+        selectSort(sort, skipHomeReload: sort.id == "home")
     }
 
-    /// 清空当前分类数据并重新加载第一页。
-    private func reloadCurrentSort() {
-        loadGeneration += 1
-        errorMessage = nil
+    private func selectSort(_ sort: MovieSort.SortData, skipHomeReload: Bool) {
+        categoryTask?.cancel()
+        categoryTask = nil
+        categoryGeneration &+= 1
+
+        selectedSort = sort
+        categoryErrorMessage = nil
+        loadMoreErrorMessage = nil
+        isLoadingCategory = false
+        isLoadingMore = false
         rawCategoryVideos = []
         categoryVideos = []
+        categoryVideoIds = []
         currentPage = 1
         hasMore = true
 
-        guard let sort = selectedSort, !sort.isHome else { return }
-        Task {
-            await loadPages(startingAt: 1, sort: sort)
-        }
+        guard !skipHomeReload else { return }
+        startCategoryLoad(page: 1, sort: sort, sourceKey: ApiConfig.shared.homeSourceBean?.key)
     }
 
-    /// 加载分类视频列表。本地年份筛选生效时，若新增可展示条目不足会自动续拉后续页。
-    private func loadPages(startingAt page: Int, sort: MovieSort.SortData) async {
-        guard !sort.isHome else { return }
-        let generation = loadGeneration
-        // 同一代次内防重复并发加载，避免分页错序；切换分类/筛选后允许立即发起新请求，
-        // 旧请求结束时也不会误清新请求的 loading 状态。
-        guard inFlightGeneration != generation else { return }
-
-        inFlightGeneration = generation
-        isLoading = true
-        defer {
-            if inFlightGeneration == generation {
-                inFlightGeneration = nil
-                isLoading = false
+    /// 启动分类加载任务，任务内部再次校验令牌后才提交结果。
+    private func startCategoryLoad(page: Int, sort: MovieSort.SortData, sourceKey: String?) {
+        guard let sourceKey, let source = ApiConfig.shared.homeSourceBean, source.key == sourceKey else {
+            // 无法发起请求时给出明确结果，不能停留在“加载中”。
+            if page <= 1 {
+                categoryErrorMessage = "尚未配置可用的数据源"
+            } else {
+                loadMoreErrorMessage = "尚未配置可用的数据源"
             }
+            return
         }
 
-        var nextPage = page
-        var extraPages = 0
-        let displayedBefore = categoryVideos.count
-
-        while true {
-            do {
-                let videos = try await fetchPage(nextPage, sort: sort)
-                // 分类或筛选切换过程中，丢弃旧请求结果
-                guard generation == loadGeneration else { return }
-
-                if nextPage == 1 {
-                    rawCategoryVideos = videos
-                } else {
-                    rawCategoryVideos.append(contentsOf: videos)
-                }
-                applyLocalFilters()
-                // 以"返回非空"作为是否继续分页的轻量判断。
-                currentPage = nextPage
-                hasMore = !videos.isEmpty
-            } catch {
-                guard generation == loadGeneration else { return }
-                errorMessage = error.localizedDescription
-                return
-            }
-
-            guard hasMore, isLocalYearFilterActive(for: sort), extraPages < Self.maxAutoFillPages else { return }
-            let gained = categoryVideos.count - displayedBefore
-            // 首屏凑够最少条数；翻页时至少要带来一条新内容，否则底部触发器不会再次出现。
-            let needsMore = categoryVideos.count < Self.minFilteredCount || gained == 0
-            guard needsMore else { return }
-            extraPages += 1
-            nextPage += 1
-        }
-    }
-
-    /// 切换本地年份后，已加载数据过滤得太少时补拉几页。
-    private func fillFilteredResultsIfNeeded(sort: MovieSort.SortData) async {
-        guard isLocalYearFilterActive(for: sort), hasMore,
-              categoryVideos.count < Self.minFilteredCount else { return }
-        await loadPages(startingAt: currentPage + 1, sort: sort)
-    }
-
-    /// 按分类类型请求单页数据。
-    private func fetchPage(_ page: Int, sort: MovieSort.SortData) async throws -> [Movie.Video] {
+        let generation = categoryGeneration
         let selections = effectiveSelections(for: sort)
-        if sort.isDouban {
-            typealias Key = MovieSort.SortFilter
-            return try await sourceService.getDoubanList(
-                kind: selections[Key.doubanKindKey] ?? "movie",
-                sort: selections[Key.doubanSortKey] ?? "T",
-                tags: [selections[Key.doubanYearKey] ?? "", selections[Key.doubanAreaKey] ?? ""],
-                page: page
-            )
+        let token = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.isCategoryResultCurrent(generation: generation, sortId: sort.id, sourceKey: sourceKey) {
+                    self.isLoadingCategory = false
+                    self.isLoadingMore = false
+                    self.categoryTask = nil
+                }
+            }
+            var nextPage = page
+            var extraPages = 0
+            let displayedBefore = self.categoryVideos.count
+            while true {
+                let result = await self.fetchCategoryPage(source: source, sort: sort, page: nextPage, selections: selections)
+                guard self.isCategoryResultCurrent(generation: generation, sortId: sort.id, sourceKey: sourceKey) else { return }
+                await self.commitCategoryResult(result, page: nextPage, sort: sort, sourceKey: sourceKey, generation: generation)
+                guard case .success = result, self.hasMore, self.isLocalYearFilterActive(for: sort),
+                      extraPages < Self.maxAutoFillPages else { return }
+                guard self.categoryVideos.count < Self.minFilteredCount || self.categoryVideos.count == displayedBefore else { return }
+                nextPage += 1
+                extraPages += 1
+            }
         }
-        guard let source = ApiConfig.shared.homeSourceBean else { return [] }
-        return try await sourceService.getList(sourceBean: source, sortData: sort, page: page, filters: selections)
+        categoryTask?.cancel()
+        categoryTask = token
+
+        if page == 1 {
+            isLoadingCategory = true
+        } else {
+            isLoadingMore = true
+        }
     }
+
+    private func fetchCategoryPage(
+        source: SourceBean,
+        sort: MovieSort.SortData,
+        page: Int,
+        selections: [String: String]
+    ) async -> Result<SourceService.VideoPage, Error> {
+        do {
+            if sort.isDouban {
+                typealias Key = MovieSort.SortFilter
+                let videos = try await sourceService.getDoubanList(
+                    kind: selections[Key.doubanKindKey] ?? "movie",
+                    sort: selections[Key.doubanSortKey] ?? "T",
+                    tags: [selections[Key.doubanYearKey] ?? "", selections[Key.doubanAreaKey] ?? ""],
+                    page: page
+                )
+                return .success(SourceService.VideoPage(videos: videos, page: page, pageCount: nil, total: nil, limit: nil))
+            }
+            let result = try await sourceService.getList(sourceBean: source, sortData: sort, page: page, filters: selections)
+            return .success(result)
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    private func commitCategoryResult(
+        _ result: Result<SourceService.VideoPage, Error>,
+        page: Int,
+        sort: MovieSort.SortData,
+        sourceKey: String,
+        generation: Int
+    ) async {
+        guard isCategoryResultCurrent(generation: generation, sortId: sort.id, sourceKey: sourceKey) else { return }
+
+        switch result {
+        case .success(let videoPage):
+            if page <= 1 {
+                categoryVideoIds = []
+                rawCategoryVideos = []
+                categoryVideos = []
+            }
+            // 按来源 + 视频 ID 去重，保持服务端顺序；重复的末页不会带来新条目。
+            let uniqueVideos = videoPage.videos.filter { categoryVideoIds.insert($0.id).inserted }
+            rawCategoryVideos.append(contentsOf: uniqueVideos)
+            applyLocalFilters()
+            hasMore = Self.hasMorePages(after: videoPage, newItemCount: uniqueVideos.count)
+            currentPage = page
+            categoryErrorMessage = nil
+            loadMoreErrorMessage = nil
+            lastLoadFailedDueToNetwork = false
+        case .failure(let error):
+            if page <= 1 {
+                categoryErrorMessage = error.localizedDescription
+                hasMore = true
+            } else {
+                loadMoreErrorMessage = error.localizedDescription
+            }
+            lastLoadFailedDueToNetwork = error.isNetworkConnectionError
+        }
+
+    }
+
+    private func isCategoryResultCurrent(generation: Int, sortId: String, sourceKey: String) -> Bool {
+        guard !Task.isCancelled, generation == categoryGeneration else { return false }
+        guard selectedSort?.id == sortId else { return false }
+        return ApiConfig.shared.homeSourceBean?.key == sourceKey
+    }
+
+    /// 判断服务端是否还有下一页：优先用分页元数据，其次用“本页是否带来新内容”兜底，
+    /// 避免服务端在末页之后仍返回最后一页内容时无限分页。
+    nonisolated static func hasMorePages(after page: SourceService.VideoPage, newItemCount: Int) -> Bool {
+        guard newItemCount > 0 else { return false }
+        if let pageCount = page.pageCount, pageCount > 0 {
+            return page.page < pageCount
+        }
+        if let total = page.total, let limit = page.limit, total > 0, limit > 0 {
+            return page.page * limit < total
+        }
+        if let limit = page.limit, limit > 0, page.videos.count < limit {
+            return false
+        }
+        return true
+    }
+
+    // MARK: - 分页
 
     /// 加载下一页
     func loadMore() async {
-        guard let lastItem = categoryVideos.last else { return }
-        await loadMoreIfNeeded(currentItem: lastItem)
+        guard selectedSort?.id != "home" else { return }
+        guard let sort = selectedSort, hasMore, loadMoreErrorMessage == nil else { return }
+        guard !isLoadingCategory, !isLoadingMore else { return }
+        startCategoryLoad(page: currentPage + 1, sort: sort, sourceKey: ApiConfig.shared.homeSourceBean?.key)
     }
 
     /// 当最后一个元素出现时触发加载下一页
     func loadMoreIfNeeded(currentItem: Movie.Video) async {
-        guard let sort = selectedSort, !sort.isHome else { return }
-        guard hasMore, !isLoading else { return }
         guard categoryVideos.last?.id == currentItem.id else { return }
-
-        await loadPages(startingAt: currentPage + 1, sort: sort)
+        await loadMore()
     }
 
-    /// 刷新
-    func refresh() async {
-        // 全量刷新时重置分页与错误态，再重新拉分类与当前分类内容（保留筛选选择）。
-        loadGeneration += 1
-        currentPage = 1
-        hasMore = true
-        rawCategoryVideos = []
-        categoryVideos = []
-        errorMessage = nil
-        await loadSorts()
+    /// 分页失败后重试当前页。
+    func retryLoadMore() async {
+        loadMoreErrorMessage = nil
+        await loadMore()
+    }
 
-        guard let sort = selectedSort else { return }
-        if sort.isHome { return }
+    /// 分类首屏失败后重试。
+    func retryCategory() async {
+        categoryErrorMessage = nil
+        guard let sort = selectedSort, sort.id != "home" else { return }
+        startCategoryLoad(page: 1, sort: sort, sourceKey: ApiConfig.shared.homeSourceBean?.key)
+    }
 
-        if let matchedSort = sorts.first(where: { $0.id == sort.id }) {
-            selectedSort = matchedSort
-        } else if let firstCategory = sorts.first(where: { !$0.isHome && !$0.isDouban }) {
-            selectedSort = firstCategory
-        } else {
-            return
+    // MARK: - 网络恢复与配置变更
+
+    /// 网络恢复时，若上次因网络错误导致首页为空，自动重新加载。
+    private func setupNetworkRestoredAutoRetry() {
+        networkRestoredCancellable = NetworkMonitor.shared.networkRestoredPublisher
+            .sink { [weak self] in
+                guard let self else { return }
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    guard self.lastLoadFailedDueToNetwork || (self.sorts.isEmpty && self.homeVideos.isEmpty) else { return }
+                    await self.refresh()
+                }
+            }
+    }
+
+    /// 配置重新加载或主页源变化（含设置页切换数据源）时自动刷新，避免页面停留在旧源的数据上。
+    /// 两个信号在一次配置加载中会先后到达，合并后只刷新一次。
+    private func setupConfigChangeReload() {
+        configChangeCancellable = Publishers.CombineLatest(
+            ApiConfig.shared.$configVersion,
+            ApiConfig.shared.$homeSourceBean.map { $0?.key }
+        )
+        .dropFirst()
+        .debounce(for: .milliseconds(50), scheduler: RunLoop.main)
+        .sink { [weak self] version, sourceKey in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                // 已经在为同一来源与配置加载（如首页菜单切源时已主动刷新）就不再重复。
+                guard version != self.requestedConfigVersion || sourceKey != self.requestedSourceKey else { return }
+                await self.reload(clearContent: true)
+            }
         }
-        if let current = selectedSort {
-            await loadPages(startingAt: 1, sort: current)
-        }
+    }
+
+    /// 按业务身份去重并保持原有顺序。
+    private static func deduplicated(_ videos: [Movie.Video]) -> [Movie.Video] {
+        var seen: Set<Movie.Video.Identity> = []
+        return videos.filter { seen.insert($0.id).inserted }
     }
 }

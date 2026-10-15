@@ -15,8 +15,16 @@ struct Movie: Codable {
     
     /// 单个视频条目
     struct Video: Codable, Identifiable, Hashable {
-        /// 视频唯一 ID（接口可能返回 Int 或 String，见自定义解码）。
-        var id: String
+        /// 跨源业务身份：后端 `vod_id` 只在单个源内唯一，必须与来源一起区分。
+        struct Identity: Hashable {
+            let sourceKey: String
+            let vodId: String
+        }
+        
+        /// SwiftUI 列表、去重与导航使用的业务身份（来源 + 视频 ID）。
+        var id: Identity { Identity(sourceKey: sourceKey, vodId: vodId) }
+        /// 后端视频 ID（接口可能返回 Int 或 String，见自定义解码）；详情请求仍使用该原始值。
+        var vodId: String
         /// 片名。
         var name: String = ""
         /// 海报地址。
@@ -37,28 +45,32 @@ struct Movie: Codable {
         var des: String = ""
         /// 来源站点 key，用于跨源隔离收藏与历史。
         var sourceKey: String = ""
+        /// 来源站点接口身份（仅从收藏/历史打开时携带），用于识别同名 key 已指向其他接口的情况。
+        var sourceApi: String = ""
         /// 分类 ID。
         var tid: String = ""
         /// 最后更新时间。
         var last: String = ""
         /// 播放来源信息（部分接口会复用该字段）。
         var dt: String = ""
+        
         /// 评分（优先豆瓣评分 `vod_douban_score`，其次站内评分 `vod_score`），用于排序。
         var score: Double = 0
         /// 热度/点击数（`vod_hits`），用于"热门"排序。
         var hits: Int = 0
 
-        init(id: String = UUID().uuidString, name: String = "", pic: String = "",
-             note: String = "", sourceKey: String = "") {
-            self.id = id
+        init(vodId: String = UUID().uuidString, name: String = "", pic: String = "",
+             note: String = "", sourceKey: String = "", sourceApi: String = "") {
+            self.vodId = vodId
             self.name = name
             self.pic = pic
             self.note = note
             self.sourceKey = sourceKey
+            self.sourceApi = sourceApi
         }
         
         enum CodingKeys: String, CodingKey {
-            case id = "vod_id"
+            case vodId = "vod_id"
             case name = "vod_name"
             case pic = "vod_pic"
             case note = "vod_remarks"
@@ -72,14 +84,15 @@ struct Movie: Codable {
             case last = "vod_time"
             case dt = "vod_play_from"
             case sourceKey
+            case sourceApi
             case score = "vod_score"
             case doubanScore = "vod_douban_score"
             case hits = "vod_hits"
         }
-
+        
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
-            try container.encode(id, forKey: .id)
+            try container.encode(vodId, forKey: .vodId)
             try container.encode(name, forKey: .name)
             try container.encode(pic, forKey: .pic)
             try container.encode(note, forKey: .note)
@@ -93,6 +106,7 @@ struct Movie: Codable {
             try container.encode(last, forKey: .last)
             try container.encode(dt, forKey: .dt)
             try container.encode(sourceKey, forKey: .sourceKey)
+            try container.encode(sourceApi, forKey: .sourceApi)
             try container.encode(score, forKey: .score)
             try container.encode(hits, forKey: .hits)
         }
@@ -111,10 +125,10 @@ struct Movie: Codable {
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             // 支持 String 或 Int 类型的 id
-            if let intId = try? container.decode(Int.self, forKey: .id) {
-                self.id = String(intId)
+            if let intId = try? container.decode(Int.self, forKey: .vodId) {
+                self.vodId = String(intId)
             } else {
-                self.id = (try? container.decode(String.self, forKey: .id)) ?? UUID().uuidString
+                self.vodId = (try? container.decode(String.self, forKey: .vodId)) ?? UUID().uuidString
             }
             self.name = (try? container.decode(String.self, forKey: .name)) ?? ""
             self.pic = (try? container.decode(String.self, forKey: .pic)) ?? ""
@@ -134,6 +148,7 @@ struct Movie: Codable {
             self.last = (try? container.decode(String.self, forKey: .last)) ?? ""
             self.dt = (try? container.decode(String.self, forKey: .dt)) ?? ""
             self.sourceKey = (try? container.decode(String.self, forKey: .sourceKey)) ?? ""
+            self.sourceApi = (try? container.decode(String.self, forKey: .sourceApi)) ?? ""
             let doubanScore = Self.decodeLossyDouble(container, .doubanScore)
             self.score = doubanScore > 0 ? doubanScore : Self.decodeLossyDouble(container, .score)
             self.hits = Int(Self.decodeLossyDouble(container, .hits))

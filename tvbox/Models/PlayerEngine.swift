@@ -121,6 +121,15 @@ enum VLCBufferMode: Int, CaseIterable, Identifiable {
         VLCBufferMode(rawValue: rawValue) ?? defaultMode
     }
 
+    /// 读取用户保存的缓冲策略，设置页与播放器统一走这里。
+    /// 从未保存过时返回默认值：`integer(forKey:)` 对缺失键返回 0，会被误判为“低延迟”。
+    static func stored(in defaults: UserDefaults = .standard) -> VLCBufferMode {
+        guard defaults.object(forKey: HawkConfig.PLAY_VLC_BUFFER_MODE) != nil else {
+            return defaultMode
+        }
+        return fromStoredValue(defaults.integer(forKey: HawkConfig.PLAY_VLC_BUFFER_MODE))
+    }
+
     var enableFrameDrop: Bool {
         self == .lowLatency
     }
@@ -148,4 +157,27 @@ enum VLCBufferMode: Int, CaseIterable, Identifiable {
             return (network: 8000, live: 6800, file: 8400)
         }
     }
+}
+
+/// 倍速文案：两个播放内核共用，保留有效小数并去掉无意义的尾零（0.75x、1.25x、1x）。
+enum PlaybackRateFormatter {
+    static func label(for rate: Float) -> String {
+        if rate.rounded() == rate {
+            return "\(Int(rate))x"
+        }
+        if (rate * 10).rounded() == rate * 10 {
+            return "\(String(format: "%.1f", rate))x"
+        }
+        return "\(String(format: "%.2f", rate))x"
+    }
+}
+
+/// HLS 选流约束：保留主播放列表（含外置音轨/字幕组等上下文），由播放器在主列表内按约束选择变体。
+/// 用于依赖 `EXT-X-MEDIA` 外置媒体组的主列表——直接播放变体子列表会丢失这些轨道。
+struct PlaybackQualityConstraint: Hashable {
+    /// 目标变体声明的 BANDWIDTH（bit/s），播放器只选择不超过该码率的变体。
+    let peakBitRate: Int
+    /// 目标变体分辨率（RESOLUTION 属性），缺省时只按码率约束。
+    let maxWidth: Int?
+    let maxHeight: Int?
 }

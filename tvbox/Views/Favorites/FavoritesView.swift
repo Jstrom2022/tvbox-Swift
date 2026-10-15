@@ -99,6 +99,12 @@ struct FavoritesView: View {
     
     /// 将收藏记录映射成详情页可识别的视频对象。
     private func movieVideo(from item: VodCollect) -> Movie.Video {
-        Movie.Video(id: item.vodId, name: item.vodName, pic: item.vodPic, sourceKey: item.sourceKey)
+        Movie.Video(
+            vodId: item.vodId,
+            name: item.vodName,
+            pic: item.vodPic,
+            sourceKey: item.sourceKey,
+            sourceApi: item.sourceApi
+        )
     }
 }

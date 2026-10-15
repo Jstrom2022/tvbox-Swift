@@ -51,7 +51,7 @@ struct VodInfo: Codable, Identifiable {
     
     /// 从 Movie.Video 和详情数据构建
     static func from(video: Movie.Video, playFrom: String, playUrl: String) -> VodInfo {
-        var info = VodInfo(id: video.id)
+        var info = VodInfo(id: video.vodId)
         info.name = video.name
         info.pic = video.pic
         info.note = video.note
@@ -63,29 +63,75 @@ struct VodInfo: Codable, Identifiable {
         info.des = video.des.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
         info.sourceKey = video.sourceKey
         
-        // 解析播放列表：
-        // playFrom 格式: "线路1$$$线路2$$$线路3"
-        // playUrl  格式: "第1集$url1#第2集$url2$$$第1集$url3#第2集$url4"
-        let flags = playFrom.components(separatedBy: "$$$").filter { !$0.isEmpty }
-        let urls = playUrl.components(separatedBy: "$$$")
-        
-        info.playFlags = flags
-        for (i, flag) in flags.enumerated() {
-            if i < urls.count {
-                let episodes = urls[i].components(separatedBy: "#").compactMap { item -> Episode? in
-                    let parts = item.components(separatedBy: "$")
-                    guard parts.count >= 2 else { return nil }
-                    return Episode(name: parts[0], url: parts[1])
-                }
-                info.playUrlMap[flag] = episodes
-            }
+        let lines = parsePlayLines(playFrom: playFrom, playUrl: playUrl)
+        info.playFlags = lines.map(\.flag)
+        for line in lines {
+            info.playUrlMap[line.flag] = line.episodes
         }
-        
-        if let first = flags.first {
-            info.playFlag = first
+
+        if let first = lines.first {
+            info.playFlag = first.flag
         }
-        
+
         return info
+    }
+
+    /// 解析播放列表：
+    /// - playFrom 格式: "线路1$$$线路2$$$线路3"
+    /// - playUrl  格式: "第1集$url1#第2集$url2$$$第1集$url3#第2集$url4"
+    ///
+    /// 线路名与剧集组先按原始位置一一配对，再过滤没有剧集的线路，空槽不会让后续线路错位；
+    /// 空线路名、多出来的剧集组生成“线路N”，重名线路追加序号，避免字典后写覆盖前写。
+    static func parsePlayLines(playFrom: String, playUrl: String) -> [(flag: String, episodes: [Episode])] {
+        let rawFlags = playFrom.components(separatedBy: "$$$")
+        let rawGroups = playUrl.components(separatedBy: "$$$")
+        var lines: [(flag: String, episodes: [Episode])] = []
+        var usedFlags: Set<String> = []
+
+        for (index, group) in rawGroups.enumerated() {
+            let episodes = parseEpisodes(group)
+            guard !episodes.isEmpty else { continue }
+
+            let rawFlag = index < rawFlags.count
+                ? rawFlags[index].trimmingCharacters(in: .whitespacesAndNewlines)
+                : ""
+            let baseFlag = rawFlag.isEmpty ? "线路\(index + 1)" : rawFlag
+            var flag = baseFlag
+            var duplicateIndex = 2
+            while usedFlags.contains(flag) {
+                flag = "\(baseFlag) \(duplicateIndex)"
+                duplicateIndex += 1
+            }
+            usedFlags.insert(flag)
+            lines.append((flag: flag, episodes: episodes))
+        }
+
+        return lines
+    }
+
+    /// 解析单条线路的剧集：每集只按第一个 `$` 拆分名称与地址，地址中的 `$` 原样保留。
+    /// 只有地址没有集名的条目（部分源的写法）按顺序生成“第N集”。
+    static func parseEpisodes(_ group: String) -> [Episode] {
+        var episodes: [Episode] = []
+        for item in group.components(separatedBy: "#") {
+            let trimmed = item.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+
+            let name: String
+            let url: String
+            if let separator = trimmed.firstIndex(of: "$") {
+                name = String(trimmed[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+                url = String(trimmed[trimmed.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if trimmed.contains("://") {
+                name = ""
+                url = trimmed
+            } else {
+                continue
+            }
+            guard !url.isEmpty else { continue }
+            episodes.append(Episode(name: name.isEmpty ? "第\(episodes.count + 1)集" : name, url: url))
+        }
+        return episodes
     }
     
     /// 当前线路下的剧集。

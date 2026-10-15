@@ -276,6 +276,7 @@ struct ContentView: View {
                         
                         // 确认按钮
                         Button {
+                            appState.configLoadError = nil
                             Task {
                                 await settingsVM.loadConfig()
                                 if settingsVM.configSuccess {
@@ -344,8 +345,22 @@ struct ContentView: View {
                     }
                     .padding(.horizontal, 30)
                     
-                    // 错误提示
-                    if let error = settingsVM.configError {
+                    // 启动时自动恢复上次配置的进度
+                    if appState.isLoadingConfig && !settingsVM.isLoadingConfig {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .tint(.white)
+                            Text("正在恢复上次使用的配置…")
+                        }
+                        .font(.caption)
+                        .foregroundColor(.white.opacity(0.8))
+                        .padding()
+                        .glassCard(cornerRadius: 10)
+                        .padding(.horizontal, 30)
+                    }
+
+                    // 错误提示：手动加载的错误优先，其次是启动恢复/自动重试的错误
+                    if let error = settingsVM.configError ?? appState.configLoadError {
                         HStack {
                             Image(systemName: "exclamationmark.circle.fill")
                             Text(error)

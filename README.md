@@ -1,8 +1,8 @@
 # TVBox-Swift
 
 ![Platform iOS | macOS](https://img.shields.io/badge/Platform-iOS%20%7C%20macOS-blue.svg)
-![Swift Version](https://img.shields.io/badge/Swift-5.9-orange.svg)
-![Xcode Version](https://img.shields.io/badge/Xcode-15.0+-blue.svg)
+![Swift Version](https://img.shields.io/badge/Swift-6%20toolchain%20(Swift%205%20mode)-orange.svg)
+![Xcode Version](https://img.shields.io/badge/Xcode-16.0+-blue.svg)
 
 **TVBox-Swift** 是一套基于原生 Swift & SwiftUI 构建的跨平台多媒体应用核心工程。它同时支持 macOS 和 iOS 设备，致力于在双端提供无缝、现代且极其流畅的视听体验。
 
@@ -17,7 +17,7 @@
   - 原生级体验的暗黑模式 (Dark Mode) 全方位支持。
 - 🧩 **全方位的媒体功能栈 (Media Stack)**
   - **点播中心 (VOD Center):** 整合了智能资源检索、卡片化视觉呈现与多级详情页。
-    - *生态支持:* 原生支持解析主流的 CMS JSON/XML 数据源接口 (`type=0`, `type=1`)。
+    - *生态支持:* 原生支持解析主流的 CMS JSON/XML 数据源接口 (`type=0`, `type=1`)，以及由服务端执行爬虫规则的 T4 远程接口 (`type=4`，如 drpy-node)。
     - *暂不支持:* 由于 iOS/macOS 平台原生限制与环境安全，内核未集成基于 Java 引擎或 Rhino 逻辑层，**不支持** `type=3` (Spider / Jar) 等依赖动态脚本执行的复杂爬虫源。
   - **直播支持 (Live):** 稳定的流媒体播放基础构件支持。
   - **内容枢纽 (Content Hub):** 便捷的搜索、智能历史记录流、一键收藏管理。
@@ -27,10 +27,12 @@
 
 ## 🛠 技术栈
 
-* **语言**: Swift 5.9
+* **语言**: Swift（Swift 6 编译器，Swift 5 语言模式）
 * **UI 框架**: SwiftUI
 * **数据持久化**: SwiftData
-* **工程化管理**: XcodeGen (>= 2.35)
+* **播放内核**: AVPlayer + VLCKit（SPM 包 `vlckit-spm` 3.6.x）
+* **测试**: Swift Testing（`tvboxTests` target，挂在 iOS 应用上运行）
+* **工程化管理**: XcodeGen (>= 2.35)，仅在修改 `project.yml` 后需要重新生成工程
 
 ---
 
@@ -39,14 +41,15 @@
 以下差异基于当前仓库代码：
 
 1. **源类型支持范围不同**
-   - Swift 版支持 `type=0/1/4`（XML/JSON/Remote）。
-   - Swift 版暂不支持 `type=3 (JAR/Spider)` 动态脚本源。
+   - Swift 版支持 `type=0/1/4`（XML/JSON/Remote）。T4 源播放前会像安卓版一样请求 `play` 接口换取真实地址，并把返回的请求头交给播放器（VLC 内核只能携带 User-Agent 与 Referer，需要 Cookie 等请求头时请用系统播放器）。
+   - Swift 版暂不支持 `type=3 (JAR/JS/PY Spider)` 动态脚本源，源列表按 `api` 标注为 JAR / JS / PY / PHP。
+   - 接入 drpy-node 等 T4 服务时，配置地址要用对外地址（drpy-node 为 `http://<服务器IP>:5757/config/1`）：不带 `/1` 时生成的站点地址指向 `127.0.0.1`，在其他设备上无法访问。
 2. **配置兼容能力不同**
    - 安卓版支持加密配置解密、`clan://`、相对路径修复、独立直播配置加载等。
    - Swift 版当前为常规 URL 拉取 + 注释容错解析。
 3. **解析链路能力不同**
    - 安卓版支持嗅探/解析切换、规则引擎与相关过滤策略。
-   - Swift 版当前仅解析并展示解析器配置数量，未接入完整播放解析链路。
+   - Swift 版当前仅解析并展示解析器配置数量，未接入完整播放解析链路：`play` 接口返回 `parse=1` / `jx=1`（需要嗅探或解析）的剧集会提示暂不支持，`proxy://` 本地代理地址同样不支持。
 4. **播放器能力不同**
    - 安卓版支持系统/IJK/EXO/外部播放器等多模式。
    - Swift 版当前支持系统 `AVPlayer` 与 `VLCKit`（iOS/macOS）双引擎切换，IJK/EXO/外部播放器仍未接入。
@@ -55,7 +58,8 @@
    - Swift 版当前尚未接入完整字幕功能。
 6. **直播高级能力不同**
    - 安卓版支持 EPG、回看/时移、分组密码、直播设置分组等。
-   - Swift 版当前已支持基础直播分组与线路切换，EPG 仍为简化实现。
+   - Swift 版当前已支持基础直播分组、线路切换与失败自动切线，支持直播配置中的 `ua` 字段（列表下载与播放均使用）；EPG 仍为简化实现。
+   - 直播地址需要是包含 `lives` 的 JSON 配置，暂不支持直接填写 M3U/TXT 列表地址。
 7. **筛选与检索形态不同**
    - 安卓版具备分类筛选、快速搜索、复选搜索等界面与交互。
    - Swift 版当前为基础搜索与分类浏览。
@@ -65,56 +69,62 @@
 9. **设置项覆盖度不同**
    - 安卓版设置项更细（DoH、渲染/缩放、历史条数、M3U8 净化、备份恢复等）。
    - Swift 版当前保留核心常用设置。
-10. **收藏入口闭环不同**
-   - 安卓版详情页支持直接加入/取消收藏。
-   - Swift 版目前提供收藏页与收藏数据模型，但详情页收藏入口待完善。
 
 ---
 
 ## 🚀 快速开始
 
-本项目的主 Xcode 工程文件并未直接包含在仓库代码中，以保证干净的源码树并降低拉取冲突风险。您需要通过 `XcodeGen` 生成配置文件。
+仓库已提交 `tvbox.xcodeproj`，克隆后可直接用 Xcode 打开，无需先生成工程。
 
 ### 1. 环境准备
-确保您的设备已安装以下必备组件：
-*   **macOS** (最新版本)
-*   **Xcode 15.0** 或以上版本
-*   **Homebrew** (用于安装命令行工具)
+*   **macOS**（与所用 Xcode 版本匹配）
+*   **Xcode 16.0** 或以上版本：工程文件格式（objectVersion 77）、`@retroactive` 与 Swift Testing 都依赖 Xcode 16 的 Swift 6 工具链。当前已在 **Xcode 26.6** 上验证构建与测试，更低版本未做验证。
+*   **XcodeGen**（可选，仅修改 `project.yml` 后需要）：`brew install xcodegen`
 
-安装工程生成器 `XcodeGen`:
+### 2. 修改工程配置（可选）
+`project.yml` 是工程模板。只有修改了它才需要重新生成工程，并检查生成结果：
 ```bash
-brew install xcodegen
-```
-
-### 2. 生成 Xcode 工程
-在终端进入本项目的根目录，执行以下命令以生成 `tvbox.xcodeproj` 文件：
-```bash
+scripts/check_project_yml.sh   # 检查重复键（YAML 会静默合并重复的 target 等配置）
 xcodegen generate
+git diff tvbox.xcodeproj       # 确认工程变更符合预期后再提交
 ```
 
-### 3. 构建与运行
-打开刚刚使用 XcodeGen 生成的 `tvbox.xcodeproj`：
-- 选择合适的 Scheme (`tvbox` 对应 iOS, `tvbox-macOS` 对应 macOS)。
-- 直接在设备或模拟器真机上 `Command + R` 进行编译与运行调试。
+### 3. 构建、运行与测试
+在 Xcode 中选择 Scheme（`tvbox` 对应 iOS，`tvbox-macOS` 对应原生 macOS）后 `Command + R`。不需要开发者账号也可以在命令行构建与测试：
+```bash
+# macOS（ad-hoc 签名）
+xcodebuild -project tvbox.xcodeproj -scheme tvbox-macOS -configuration Debug \
+  -destination 'platform=macOS' build
+
+# iOS 模拟器构建 / 单元测试（设备名可通过 xcrun simctl list devices available 查看）
+xcodebuild -project tvbox.xcodeproj -scheme tvbox \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
+xcodebuild -project tvbox.xcodeproj -scheme tvbox \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
+```
+
+> **平台说明**：iOS target 不支持 Mac Catalyst（VLCKit 3.6 的 XCFramework 不含 Catalyst 切片），在 Mac 上请使用原生 `tvbox-macOS` target。真机安装与 IPA 导出需要使用你自己的开发者团队签名。
 
 ---
 
 ### iOS 版本打包
 
-1. 确保已安装通用依赖：
-   - Xcode 15+
-   - [XcodeGen](https://github.com/yonaskolb/XcodeGen) (可选，用于生成工程)
+`package_ios.sh` 面向已具备企业/分发证书的维护者，运行前需要准备：
 
-2. 运行打包脚本：
-   ```bash
-   chmod +x package_ios.sh
-   ./package_ios.sh
-   ```
+1. `IOS-key/secrets.sh`：定义 `P12_PASSWORD`、`PROVISION_UUID`、`TEAM_ID`、`BUNDLE_ID`、`SIGNING_IDENTITY`；
+2. `IOS-key/cert.p12` 与 `IOS-key/cert.mobileprovision`（`IOS-key/` 已在 `.gitignore` 中）；
+3. `ExportOptions.plist` 中的 `teamID`、`method`、`signingCertificate` 与上述证书一致；
+4. 已安装 XcodeGen（脚本会执行 `xcodegen generate`）。
 
-3. **注意**：
-   - 脚本默认生成 `.xcarchive` 文件。
-   - 如需自动生成 `.ipa`，请在 `ExportOptions.plist` 中填写您的 `teamID`。
-   - 您也可以在 Xcode 中打开 `tvbox.xcodeproj`，选择 `tvbox` scheme，然后点击 `Product > Archive` 手动打包。
+```bash
+chmod +x package_ios.sh
+./package_ios.sh
+```
+
+**注意**：
+- 脚本会把证书导入登录钥匙串，并用空密码执行 `security unlock-keychain`；若你的登录钥匙串设置了密码，请先手动解锁，否则脚本会在该步骤中止。
+- 找到 `ExportOptions.plist` 时会导出 `TVBox.ipa`，否则只生成 `build/tvbox.xcarchive`。
+- 也可以在 Xcode 中选择 `tvbox` scheme，通过 `Product > Archive` 手动打包。
 
 ## 📦 macOS 独立打包
 
@@ -140,9 +150,13 @@ chmod +x package_mac.sh
 │   ├── Persistence/    # 数据库 (SwiftData) 配置与读写管理
 │   ├── Utils/          # 通用的帮助类与扩展函数
 │   └── Assets.xcassets # 资源文件集、图标与预设全局色彩 (AccentColor)
+├── tvboxTests/         # 单元测试（Swift Testing）
+├── tvbox.xcodeproj     # 已提交的 Xcode 工程
 ├── project.yml         # XcodeGen 的工程模板描述文件
-├── package_mac.sh      # macOS DMG 打包脚本
-└── process_icon.py     # 图片转换脚本套件
+├── scripts/            # 工程辅助脚本（project.yml 重复键检查）
+├── package_ios.sh      # iOS 归档/导出脚本（需要自备签名材料）
+├── ExportOptions.plist # IPA 导出配置
+└── package_mac.sh      # macOS DMG 打包脚本
 ```
 
 ---

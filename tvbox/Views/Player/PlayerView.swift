@@ -79,7 +79,11 @@ final class SystemPlayerSessionController: ObservableObject {
 struct PlayerView: View {
     let urlString: String
     var startPosition: Double = 0
-    var onProgressChanged: ((Double, Double?) -> Void)? = nil
+    /// 需要保留 HLS 主列表时的选流约束（地址不变时就地应用）。
+    var qualityConstraint: PlaybackQualityConstraint? = nil
+    /// 播放请求需要携带的 HTTP 头（T4 play 接口返回的 header）。
+    var httpHeaders: [String: String] = [:]
+    var onProgressChanged: ((Double, Double?, String) -> Void)? = nil
     var onPlaybackEnded: (() -> Void)? = nil
     var onToggleFullScreen: (() -> Void)? = nil
     var canPlayNext: Bool = false
@@ -109,6 +113,8 @@ struct PlayerView: View {
                 AVPlayerContentView(
                     urlString: urlString,
                     startPosition: startPosition,
+                    qualityConstraint: qualityConstraint,
+                    httpHeaders: httpHeaders,
                     onProgressChanged: onProgressChanged,
                     onPlaybackEnded: onPlaybackEnded,
                     onToggleFullScreen: onToggleFullScreen,
@@ -120,6 +126,8 @@ struct PlayerView: View {
                 VLCVodPlayerView(
                     urlString: urlString,
                     startPosition: startPosition,
+                    qualityConstraint: qualityConstraint,
+                    httpHeaders: httpHeaders,
                     onProgressChanged: onProgressChanged,
                     onPlaybackEnded: onPlaybackEnded,
                     onToggleFullScreen: onToggleFullScreen,
@@ -152,9 +160,14 @@ struct PlayerView: View {
 /// 基于系统 AVPlayer 的点播播放器实现
 struct AVPlayerContentView: View {
     private static let supportedPlaybackRates: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+    /// AVURLAsset 携带自定义请求头的选项键：AVFoundation 没有公开常量，这是未写入文档但长期可用的键名。
+    private static let httpHeaderFieldsOptionKey = "AVURLAssetHTTPHeaderFieldsKey"
     let urlString: String
     var startPosition: Double = 0
-    var onProgressChanged: ((Double, Double?) -> Void)? = nil
+    var qualityConstraint: PlaybackQualityConstraint? = nil
+    /// 播放请求需要携带的 HTTP 头（UA、Referer、Cookie 等）。
+    var httpHeaders: [String: String] = [:]
+    var onProgressChanged: ((Double, Double?, String) -> Void)? = nil
     var onPlaybackEnded: (() -> Void)? = nil
     var onToggleFullScreen: (() -> Void)? = nil
     var canPlayNext: Bool = false
@@ -183,6 +196,10 @@ struct AVPlayerContentView: View {
     @State private var playerObservers: [NSKeyValueObservation] = []
     
     @State private var videoZoomScale: CGFloat = 1.0
+    /// 起播定位尚未生效时不发布进度，避免把 0 当成真实进度上报。
+    @State private var isWaitingForStartSeek = false
+    /// 失败重试时的起播位置（一次性覆盖外部传入的 startPosition）。
+    @State private var retryStartPosition: Double?
 
     var body: some View {
         ZStack {
@@ -191,6 +208,7 @@ struct AVPlayerContentView: View {
                     PlatformVideoPlayer(player: player)
                         #if os(iOS)
                         .scaleEffect(videoZoomScale)
+                        .clipped()
                         #endif
                 } else {
                     ZStack {
@@ -227,6 +245,19 @@ struct AVPlayerContentView: View {
                         .foregroundColor(.white.opacity(0.7))
                         .multilineTextAlignment(.center)
                         .lineLimit(3)
+                    HStack(spacing: 12) {
+                        Button("重试") { retryPlayback() }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.orange)
+                        #if canImport(VLCKitSPM)
+                        Button("改用 VLC") {
+                            UserDefaults.standard.set(PlayerEngine.vlc.rawValue, forKey: HawkConfig.PLAY_TYPE_VOD)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.white)
+                        #endif
+                    }
+                    .padding(.top, 4)
                 }
                 .padding()
             }
@@ -254,7 +285,15 @@ struct AVPlayerContentView: View {
                     }
                 },
                 currentTime: currentTime,
-                duration: duration
+                duration: duration,
+                currentVolume: volume,
+                volumePercentScale: 100,
+                // 系统内核的音量直接作用于 AVPlayer（0...1），与提示百分比一致。
+                onVolumeChanged: { normalized in
+                    player?.volume = Float(normalized)
+                    volume = normalized
+                    wakeUpControls()
+                }
             )
         }
         #endif
@@ -296,6 +335,10 @@ struct AVPlayerContentView: View {
             syncRateFromSettings()
             setupPlayer()
             wakeUpControls()
+        }
+        .onChange(of: qualityConstraint) { _, newValue in
+            // 播放地址不变、只调整选流约束：直接在现有 item 上生效，进度与画面保持连续。
+            Self.applyQualityConstraint(newValue, to: player?.currentItem)
         }
         .onDisappear {
             cleanupPlayer(keepSharedPlayer: sharedController != nil)
@@ -344,11 +387,15 @@ struct AVPlayerContentView: View {
         // 清理旧播放器
         cleanupPlayer()
         
-        // 使用 AVURLAsset 并设置自定义 HTTP 头，解决部分 CDN 拒绝无 User-Agent 请求的问题
-        let asset = AVURLAsset(url: url)
+        // 源要求的请求头（如 Referer 防盗链）随 AVURLAsset 一起下发；没有时使用系统默认请求头。
+        let assetOptions: [String: Any]? = httpHeaders.isEmpty
+            ? nil
+            : [Self.httpHeaderFieldsOptionKey: httpHeaders]
+        let asset = AVURLAsset(url: url, options: assetOptions)
         asset.resourceLoader.setDelegate(nil, queue: nil)
         let playerItem = AVPlayerItem(asset: asset)
         playerItem.preferredForwardBufferDuration = 0
+        Self.applyQualityConstraint(qualityConstraint, to: playerItem)
         let newPlayer = AVPlayer(playerItem: playerItem)
         newPlayer.defaultRate = preferredRate
         if let sharedController {
@@ -461,15 +508,19 @@ struct AVPlayerContentView: View {
     }
     
     private func startPlayback(for player: AVPlayer) {
-        let target = max(startPosition, 0)
+        let target = max(retryStartPosition ?? startPosition, 0)
+        retryStartPosition = nil
         
         if target > 0 {
+            isWaitingForStartSeek = true
             let seekTime = CMTime(seconds: target, preferredTimescale: 600)
             player.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+                isWaitingForStartSeek = false
                 reportProgress(for: player)
                 playAtPreferredRate(player)
             }
         } else {
+            isWaitingForStartSeek = false
             playAtPreferredRate(player)
         }
     }
@@ -542,7 +593,28 @@ struct AVPlayerContentView: View {
         if let rawDuration, rawDuration.isFinite, rawDuration >= 0 {
             self.duration = rawDuration
         }
-        onProgressChanged?(current, duration > 0 ? duration : nil)
+        // 起播定位尚未完成时上报的是 0，会让上层把续播进度丢掉。
+        guard !isWaitingForStartSeek else { return }
+        onProgressChanged?(current, duration > 0 ? duration : nil, urlString)
+    }
+    
+    /// 应用 HLS 选流约束：只限制主列表内的变体选择范围，不改变主列表本身。
+    private static func applyQualityConstraint(_ constraint: PlaybackQualityConstraint?, to item: AVPlayerItem?) {
+        guard let item else { return }
+        guard let constraint else {
+            item.preferredPeakBitRate = 0
+            item.preferredMaximumResolution = .zero
+            return
+        }
+        // 只选择不超过目标变体 BANDWIDTH 的档位；留 1% 余量，避免恰好等于上限的目标档位被排除。
+        item.preferredPeakBitRate = constraint.peakBitRate > 0
+            ? Double(constraint.peakBitRate) * 1.01
+            : 0
+        if let width = constraint.maxWidth, let height = constraint.maxHeight, width > 0, height > 0 {
+            item.preferredMaximumResolution = CGSize(width: width, height: height)
+        } else {
+            item.preferredMaximumResolution = .zero
+        }
     }
     
     private var seekStep: Double {
@@ -854,7 +926,7 @@ struct AVPlayerContentView: View {
                     showOSD(icon: "speedometer")
                 } label: {
                     HStack {
-                        Text("\(String(format: "%.1f", r))x")
+                        Text(PlaybackRateFormatter.label(for: r))
                         if r == rate {
                             Spacer()
                             Image(systemName: "checkmark")
@@ -864,7 +936,7 @@ struct AVPlayerContentView: View {
             }
         } label: {
             HStack(spacing: 4) {
-                Text("\(String(format: "%.1f", rate))x")
+                Text(PlaybackRateFormatter.label(for: rate))
                 Image(systemName: "chevron.up")
                     .font(.system(size: 8, weight: .bold))
             }
@@ -950,6 +1022,19 @@ struct AVPlayerContentView: View {
         }
     }
 
+    /// 重试当前资源：从头重建播放器，并从最近一次已知位置继续。
+    private func retryPlayback() {
+        guard Self.sanitizedURL(from: urlString) != nil else { return }
+        let resume = currentTime.isFinite ? max(currentTime, 0) : 0
+        playbackError = nil
+        // 放弃共享播放器，确保 setupPlayer 一定重新创建会话。
+        sharedController?.stop()
+        cleanupPlayer()
+        player = nil
+        retryStartPosition = resume
+        setupPlayer()
+    }
+    
     private func adjustVolume(by delta: Double) {
         guard let player else { return }
         let current = Double(player.volume)

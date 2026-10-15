@@ -36,13 +36,22 @@ struct SearchView: View {
                     searchHistorySection
                 } else if let error = viewModel.errorMessage {
                     Spacer()
-                    VStack(spacing: 8) {
+                    VStack(spacing: 12) {
                         Image(systemName: "magnifyingglass")
                             .font(.largeTitle)
                             .foregroundColor(.gray)
                         Text(error)
                             .font(.subheadline)
                             .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 32)
+                        if viewModel.canRetry {
+                            Button("重试") {
+                                Task { await viewModel.search() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.orange)
+                        }
                     }
                     Spacer()
                 }
@@ -52,6 +61,10 @@ struct SearchView: View {
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
+        }
+        // 离开搜索页时取消在途搜索：后台请求不再占用网络，返回后也不会回填过期结果。
+        .onDisappear {
+            viewModel.cancelSearch()
         }
     }
     
@@ -80,8 +93,8 @@ struct SearchView: View {
                 if !viewModel.keyword.isEmpty {
                     Button {
                         withAnimation {
-                            viewModel.keyword = ""
-                            viewModel.results = []
+                            // 统一入口：取消在途请求并清空结果，旧结果不会回填。
+                            viewModel.clearSearch()
                         }
                     } label: {
                         Image(systemName: "xmark.circle.fill")
@@ -122,6 +135,16 @@ struct SearchView: View {
     /// 搜索结果网格。
     private var searchResults: some View {
         ScrollView {
+            // 部分源失败时保留结果并提示，用户能区分“没有内容”和“没搜全”。
+            if let partial = viewModel.partialFailureMessage {
+                Text(partial)
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 8)
+            }
+            
             LazyVGrid(columns: columns, spacing: 16) {
                 ForEach(viewModel.results) { video in
                     NavigationLink(value: video) {

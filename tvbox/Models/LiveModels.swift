@@ -23,31 +23,48 @@ struct LiveChannelGroup: Codable, Identifiable, Hashable {
 
 /// 直播频道
 struct LiveChannelItem: Codable, Identifiable, Hashable {
-    /// 频道标识由名称+索引组成，规避同名频道冲突。
-    var id: String { "\(channelName)_\(channelIndex)" }
+    /// 频道稳定身份：分组 + 频道名。同一分组内的同名频道会合并为一个频道，因此该组合唯一；
+    /// 不使用数组下标，避免列表重排或增量加入后身份漂移、跨分组同名频道碰撞。
+    struct Identity: Hashable {
+        let groupName: String
+        let channelName: String
+    }
+
+    var id: Identity { Identity(groupName: groupName, channelName: channelName) }
+    /// 所属分组名。
+    var groupName: String = ""
     /// 频道名。
     var channelName: String = ""
     /// 频道在分组内的顺序索引。
     var channelIndex: Int = 0
     /// 多线路播放地址。
     var channelUrls: [String] = []
+    /// 各线路要求的 User-Agent（来自直播配置的 `ua` 字段），key 为线路地址。
+    var userAgents: [String: String] = [:]
     /// 当前选中的线路索引。
     var sourceIndex: Int = 0
     /// 可用线路总数。
     var sourceNum: Int { channelUrls.count }
     /// 台标地址（预留）。
     var logo: String = ""
-    
-    init(channelName: String = "", channelIndex: Int = 0) {
+
+    init(channelName: String = "", channelIndex: Int = 0, groupName: String = "") {
         self.channelName = channelName
         self.channelIndex = channelIndex
+        self.groupName = groupName
     }
-    
+
     /// 当前线路对应的播放地址。
     /// 当索引越界时兜底返回第一条线路，避免直接播放失败。
     var currentUrl: String? {
         guard sourceIndex >= 0, sourceIndex < channelUrls.count else { return channelUrls.first }
         return channelUrls[sourceIndex]
+    }
+
+    /// 当前线路要求的 User-Agent；未配置时返回 nil，由播放器使用默认值。
+    var currentUserAgent: String? {
+        guard let url = currentUrl, let userAgent = userAgents[url], !userAgent.isEmpty else { return nil }
+        return userAgent
     }
     
     /// 轮换到下一条线路。

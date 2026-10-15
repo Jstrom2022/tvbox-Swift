@@ -26,14 +26,31 @@ struct PlayerGestureLayer: View {
     // MARK: - Properties
     let currentTime: Double
     let duration: Double
+    /// 播放器当前音量（归一化到 0...1）。
+    var currentVolume: Double = 1.0
+    /// 提示百分比与归一化音量的换算倍数（系统内核 100，VLC 内核 200 即最高 200%）。
+    var volumePercentScale: Double = 100
+    /// 音量调节回调，参数为目标音量（归一化 0...1）。
+    var onVolumeChanged: ((Double) -> Void)? = nil
 
     // MARK: - State
     @State private var gestureMode: PlayerGestureMode = .none
     @State private var zoomScale: CGFloat = 1.0
     @State private var showIndicator = false
     @State private var dragStartX: CGFloat = 0
+    /// 拖动开始时的亮度/音量，后续调节都以起点为基准，避免累加完整位移。
+    @State private var brightnessAtGestureStart: CGFloat = 0
+    @State private var volumeAtGestureStart: Double = 0
+    /// 当前提示中展示的实际亮度/音量（来自真实控制结果）。
+    @State private var displayedBrightness: CGFloat = 0
+    @State private var displayedVolume: Double = 0
 
     // MARK: - Pure Computation Functions
+
+    /// 水平滑满一个屏幕宽度对应的快进秒数。
+    private static let seekSecondsPerScreenWidth = 120.0
+    /// 垂直滑动多少点对应亮度/音量的完整范围。
+    private static let adjustmentDistance: CGFloat = 300.0
 
     /// 根据起始位置和滑动方向确定手势类型
     static func classifyGesture(
@@ -49,14 +66,14 @@ struct PlayerGestureLayer: View {
         if absH > absV && absH > threshold {
             // 根据滑动距离动态调整快进幅度，短距离精细，长距离快速
             let normalizedOffset = translation.width / containerWidth
-            let offset = Double(normalizedOffset) * 120.0 // 滑满屏幕 = 120秒
+            let offset = Double(normalizedOffset) * seekSecondsPerScreenWidth // 滑满屏幕 = 120秒
             return .seeking(offset: offset)
         }
 
         // 垂直判定：左半区域 = 亮度，右半区域 = 音量
         if absV > threshold {
             let isLeftHalf = startX < containerWidth / 2
-            let delta = -translation.height / 300.0 // 向上为正
+            let delta = -translation.height / adjustmentDistance // 向上为正
             if isLeftHalf {
                 return .adjustingBrightness(delta: delta)
             } else {
@@ -118,22 +135,30 @@ struct PlayerGestureLayer: View {
     private func dragGesture(in geometry: GeometryProxy) -> some Gesture {
         DragGesture(minimumDistance: 5)
             .onChanged { value in
-                if gestureMode == .none {
+                let isNewGesture = gestureMode == .none
+                if isNewGesture {
                     dragStartX = value.startLocation.x
-                    HapticManager.shared.lightImpact()
                 }
 
-                let mode = Self.classifyGesture(
+                let classified = Self.classifyGesture(
                     startX: dragStartX,
                     containerWidth: geometry.size.width,
                     translation: value.translation
                 )
+                // 一次拖动只锁定一种手势，避免中途在快进与亮度/音量之间来回切换。
+                let mode = isNewGesture ? classified : Self.continueGesture(gestureMode, translation: value.translation, containerWidth: geometry.size.width)
+                guard mode != .none else { return }
 
-                if mode != .none {
-                    gestureMode = mode
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        showIndicator = true
-                    }
+                if isNewGesture {
+                    HapticManager.shared.lightImpact()
+                    brightnessAtGestureStart = UIScreen.main.brightness
+                    volumeAtGestureStart = min(max(currentVolume, 0), 1)
+                }
+
+                gestureMode = mode
+                applyAdjustment(for: mode)
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showIndicator = true
                 }
             }
             .onEnded { value in
@@ -156,6 +181,41 @@ struct PlayerGestureLayer: View {
                     showIndicator = false
                 }
             }
+    }
+
+    /// 已锁定手势类型后，按当前位移计算同类型手势的新值。
+    static func continueGesture(
+        _ mode: PlayerGestureMode,
+        translation: CGSize,
+        containerWidth: CGFloat
+    ) -> PlayerGestureMode {
+        switch mode {
+        case .seeking:
+            let normalizedOffset = translation.width / max(containerWidth, 1)
+            return .seeking(offset: Double(normalizedOffset) * seekSecondsPerScreenWidth)
+        case .adjustingBrightness:
+            return .adjustingBrightness(delta: -translation.height / adjustmentDistance)
+        case .adjustingVolume:
+            return .adjustingVolume(delta: -translation.height / adjustmentDistance)
+        case .none:
+            return .none
+        }
+    }
+
+    /// 把亮度/音量手势真正作用到屏幕与播放器上，提示值取实际结果。
+    private func applyAdjustment(for mode: PlayerGestureMode) {
+        switch mode {
+        case .adjustingBrightness(let delta):
+            let target = Self.clampAdjustment(currentValue: brightnessAtGestureStart, delta: delta)
+            UIScreen.main.brightness = target
+            displayedBrightness = target
+        case .adjustingVolume(let delta):
+            let target = Double(Self.clampAdjustment(currentValue: CGFloat(volumeAtGestureStart), delta: delta))
+            onVolumeChanged?(target)
+            displayedVolume = target
+        case .seeking, .none:
+            break
+        }
     }
 
     // MARK: - Pinch Gesture
@@ -234,20 +294,12 @@ struct PlayerGestureLayer: View {
             Text(formatTime(target))
                 .font(.caption)
                 .foregroundColor(.white)
-        case .adjustingBrightness(let delta):
-            let percentage = Int(Self.clampAdjustment(
-                currentValue: UIScreen.main.brightness,
-                delta: delta
-            ) * 100)
-            Text("\(percentage)%")
+        case .adjustingBrightness:
+            Text("\(Int((displayedBrightness * 100).rounded()))%")
                 .font(.caption)
                 .foregroundColor(.white)
-        case .adjustingVolume(let delta):
-            let percentage = Int(Self.clampAdjustment(
-                currentValue: 0.5,
-                delta: delta
-            ) * 100)
-            Text("\(percentage)%")
+        case .adjustingVolume:
+            Text("\(Int((displayedVolume * volumePercentScale).rounded()))%")
                 .font(.caption)
                 .foregroundColor(.white)
         case .none:

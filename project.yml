@@ -44,35 +44,15 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         SWIFT_EMIT_LOC_STRINGS: YES
-        SUPPORTS_MACCATALYST: YES
-        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
+        # VLCKit 3.6 的 XCFramework 不含 Mac Catalyst 切片；macOS 请使用原生 tvbox-macOS target。
+        SUPPORTS_MACCATALYST: NO
       configs:
         Debug:
           SWIFT_OPTIMIZATION_LEVEL: "-Onone"
         Release:
           SWIFT_OPTIMIZATION_LEVEL: "-O"
 
-  tvbox-Tests:
-    type: bundle.unit-test
-    platform: iOS
-    deploymentTarget: "17.0"
-    sources:
-      - path: tvbox-Tests
-      - path: tvboxTests
-    dependencies:
-      - target: tvbox
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.tvbox.app.tests
-        GENERATE_INFOPLIST_FILE: YES
-        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/TVBox.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/TVBox"
-        BUNDLE_LOADER: "$(TEST_HOST)"
-      configs:
-        Debug:
-          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
-        Release:
-          SWIFT_OPTIMIZATION_LEVEL: "-O"
-
+  # 唯一的单元测试 target：所有测试源码都放在 tvboxTests/，每个测试只执行一次。
   tvboxTests:
     type: bundle.unit-test
     platform: iOS
@@ -117,26 +97,6 @@ targets:
         SWIFT_EMIT_LOC_STRINGS: YES
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGN_ENTITLEMENTS: tvbox/tvbox-macOS.entitlements
-      configs:
-        Debug:
-          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
-        Release:
-          SWIFT_OPTIMIZATION_LEVEL: "-O"
-
-  tvboxTests:
-    type: bundle.unit-test
-    platform: iOS
-    deploymentTarget: "17.0"
-    dependencies:
-      - target: tvbox
-    sources:
-      - path: tvboxTests
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.tvbox.app.tests
-        GENERATE_INFOPLIST_FILE: YES
-        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/TVBox.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/TVBox"
-        BUNDLE_LOADER: "$(TEST_HOST)"
       configs:
         Debug:
           SWIFT_OPTIMIZATION_LEVEL: "-Onone"

@@ -12,6 +12,8 @@ struct DetailView: View {
     @StateObject private var sharedVLCController = VLCPlayerController()
     @EnvironmentObject var appState: AppState
     @Environment(\.modelContext) private var modelContext
+    /// 用于来源提示中的“返回”按钮。
+    @Environment(\.dismiss) private var dismiss
     @State private var showFullScreen = false
     /// VLC 全屏退出动画期间为 true，防止内联播放器与全屏播放器同时争抢 drawable
     @State private var isFullScreenDismissing = false
@@ -29,6 +31,8 @@ struct DetailView: View {
                     PlayerView(
                         urlString: url,
                         startPosition: viewModel.currentPlaybackSeconds(),
+                        qualityConstraint: viewModel.playbackConstraint,
+                        httpHeaders: viewModel.playHeaders,
                         onProgressChanged: handlePlaybackProgress,
                         onPlaybackEnded: playNextEpisodeIfNeeded,
                         onToggleFullScreen: {
@@ -45,18 +49,8 @@ struct DetailView: View {
                         .onTapGesture(count: 2) {
                             openFullScreenPlayer()
                         }
-                } else if !showFullScreen, viewModel.isPlaying, viewModel.playUrl == nil, viewModel.isPreparingPlayback {
-                    // 首次播放时正在解析地址或去广告：先占住播放器位置，避免布局跳动
-                    ZStack {
-                        Color.black
-                        VStack(spacing: 10) {
-                            ProgressView().tint(.orange)
-                            Text("正在准备播放…")
-                                .font(.caption)
-                                .foregroundColor(.white.opacity(0.6))
-                        }
-                    }
-                    .aspectRatio(16/9, contentMode: .fit)
+                } else if viewModel.isResolvingPlayback || viewModel.isPreparingPlayback {
+                    resolvingPlaybackPlaceholder
                 }
 
                 if let note = viewModel.adFilterNote, viewModel.isPlaying {
@@ -75,6 +69,9 @@ struct DetailView: View {
                 videoInfoSection
                     .padding(.horizontal, 20)
                     .padding(.top, 16)
+                
+                // 详情状态：加载中、加载失败、原数据源失效、来源接口变化
+                statusSection
                 
                 // 线路选择
                 if viewModel.flags.count > 1 {
@@ -113,12 +110,18 @@ struct DetailView: View {
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
-        .task(id: "\(video.sourceKey)-\(video.id)") {
-            await viewModel.loadDetail(video: video)
-            restorePlaybackFromHistory()
-            refreshCollectState()
+        .task(id: video.id) {
+            await loadDetailAndRestore()
+        }
+        .onChange(of: viewModel.isPlaying) { _, isPlaying in
+            // 播放会话结束（如切到没有剧集的线路）时必须停止共享播放器，否则会继续出声。
+            if !isPlaying {
+                sharedSystemController.stop()
+                sharedVLCController.stop()
+            }
         }
         .onDisappear {
+            viewModel.cancelPlaybackResolution()
             viewModel.commitPlaybackProgressSnapshot()
             persistHistoryIfNeeded(force: true)
             showFullScreen = false
@@ -135,6 +138,8 @@ struct DetailView: View {
                 FullScreenPlayerView(
                     urlString: url,
                     startPosition: viewModel.currentPlaybackSeconds(),
+                    qualityConstraint: viewModel.playbackConstraint,
+                    httpHeaders: viewModel.playHeaders,
                     onProgressChanged: handlePlaybackProgress,
                     onPlaybackEnded: playNextEpisodeIfNeeded,
                     canPlayNext: canPlayNextEpisode,
@@ -169,6 +174,8 @@ struct DetailView: View {
                 FullScreenPlayerView(
                     urlString: url,
                     startPosition: viewModel.currentPlaybackSeconds(),
+                    qualityConstraint: viewModel.playbackConstraint,
+                    httpHeaders: viewModel.playHeaders,
                     onProgressChanged: handlePlaybackProgress,
                     onPlaybackEnded: playNextEpisodeIfNeeded,
                     canPlayNext: canPlayNextEpisode,
@@ -183,6 +190,110 @@ struct DetailView: View {
             }
         }
         #endif
+    }
+    
+    /// 正在向源请求真实播放地址时的占位（T4 源播放前需要先调用 play 接口）。
+    private var resolvingPlaybackPlaceholder: some View {
+        ZStack {
+            Color.black
+            VStack(spacing: 10) {
+                ProgressView()
+                    .tint(.white)
+                Text("正在获取播放地址…")
+                    .font(.footnote)
+                    .foregroundColor(.white.opacity(0.7))
+            }
+        }
+        .aspectRatio(16/9, contentMode: .fit)
+    }
+    
+    // MARK: - 详情状态
+    
+    @ViewBuilder
+    private var statusSection: some View {
+        if let notice = viewModel.playbackNotice {
+            statusCard(icon: "exclamationmark.triangle.fill", tint: .yellow, message: notice)
+        }
+        
+        if viewModel.isLoading {
+            HStack(spacing: 10) {
+                ProgressView()
+                    .tint(.orange)
+                Text("正在加载影片详情…")
+                    .font(.footnote)
+                    .foregroundColor(.white.opacity(0.7))
+            }
+            .padding(15)
+            .glassCard(cornerRadius: AppTheme.glassRadius)
+            .padding(.horizontal, 20)
+            .padding(.top, 12)
+        } else if let error = viewModel.errorMessage {
+            statusCard(
+                icon: "exclamationmark.triangle.fill",
+                tint: .yellow,
+                message: error,
+                retry: { Task { await loadDetailAndRestore() } }
+            )
+        } else if let error = viewModel.sourceErrorMessage {
+            // 原来源已失效时重试没有意义，引导用户重新搜索选择来源。
+            statusCard(icon: "questionmark.folder", tint: .orange, message: error)
+        }
+        
+        if let mismatch = viewModel.sourceMismatchMessage {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .foregroundColor(.orange)
+                    Text(mismatch)
+                        .font(.footnote)
+                        .foregroundColor(.white.opacity(0.85))
+                }
+                
+                HStack(spacing: 12) {
+                    Button("仍然打开") {
+                        openDespiteSourceMismatch()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                    
+                    Button("返回") { dismiss() }
+                        .buttonStyle(.bordered)
+                }
+            }
+            .padding(15)
+            .glassCard(cornerRadius: AppTheme.glassRadius)
+            .padding(.horizontal, 20)
+            .padding(.top, 12)
+        }
+    }
+    
+    private func statusCard(
+        icon: String,
+        tint: Color,
+        message: String,
+        retry: (() -> Void)? = nil
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: icon)
+                    .foregroundColor(tint)
+                Text(message)
+                    .font(.footnote)
+                    .foregroundColor(.white.opacity(0.85))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            
+            if let retry {
+                Button("重试", action: retry)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(15)
+        .glassCard(cornerRadius: AppTheme.glassRadius)
+        .padding(.horizontal, 20)
+        .padding(.top, 12)
     }
     
     // MARK: - 视频信息
@@ -276,7 +387,7 @@ struct DetailView: View {
 
     @ViewBuilder
     private var playButton: some View {
-        if !viewModel.isPlaying && viewModel.vodInfo != nil {
+        if !viewModel.isPlaying && !viewModel.isResolvingPlayback && viewModel.vodInfo != nil {
             Button {
                 viewModel.selectEpisode(index: 0)
                 saveHistoryForCurrentEpisode()
@@ -492,6 +603,46 @@ struct DetailView: View {
         viewModel.selectedEpisodeIndex + 1 < viewModel.currentEpisodes.count
     }
     
+    /// 写入收藏/历史使用的视频对象：带上真实来源，避免回退主页源时把记录写到错误的来源下。
+    private var recordVideo: Movie.Video {
+        var copy = video
+        if let key = viewModel.resolvedSourceKey, !key.isEmpty {
+            copy.sourceKey = key
+        }
+        if let api = viewModel.resolvedSourceApi, !api.isEmpty {
+            copy.sourceApi = api
+        }
+        if let info = viewModel.vodInfo {
+            if copy.name.isEmpty { copy.name = info.name }
+            if copy.pic.isEmpty { copy.pic = info.pic }
+        }
+        return copy
+    }
+    
+    private func loadDetailAndRestore() async {
+        await viewModel.loadDetail(video: video)
+        restorePlaybackFromHistory()
+        refreshCollectState()
+    }
+    
+    /// 用户确认接口变化后继续打开：先把旧记录迁移到当前接口，再正常加载。
+    private func openDespiteSourceMismatch() {
+        guard let sourceKey = viewModel.pendingSourceKey,
+              let newApi = viewModel.pendingSourceApi else { return }
+        Task { @MainActor in
+            CacheStore.shared.remapSourceApi(
+                vodId: video.vodId,
+                sourceKey: sourceKey,
+                from: video.sourceApi,
+                to: newApi,
+                context: modelContext
+            )
+            await viewModel.loadDetail(video: video, allowsSourceAPIChange: true)
+            restorePlaybackFromHistory()
+            refreshCollectState()
+        }
+    }
+    
     private func saveHistoryForCurrentEpisode(progressOverride: Double? = nil) {
         let episodeName = viewModel.vodInfo?.currentEpisode?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let episodeLabel = episodeName.isEmpty ? "第\(viewModel.selectedEpisodeIndex + 1)集" : episodeName
@@ -507,7 +658,7 @@ struct DetailView: View {
         
         Task { @MainActor in
             CacheStore.shared.addRecord(
-                video,
+                recordVideo,
                 playNote: playNote,
                 playbackState: playbackState,
                 context: modelContext
@@ -515,14 +666,14 @@ struct DetailView: View {
         }
     }
     
-    private func handlePlaybackProgress(_ seconds: Double, _: Double?) {
-        // 切集后正在去广告时，回调来自上一集的播放器，不能记到新剧集的历史里
-        guard !viewModel.isPreparingPlayback else { return }
-        viewModel.updatePlaybackProgress(seconds: seconds)
+    private func handlePlaybackProgress(_ seconds: Double, _: Double?, mediaURL: String) {
+        // 只接受当前播放地址的回调，切集/切线路后仍在途的旧回调会被忽略。
+        guard viewModel.updatePlaybackProgress(seconds: seconds, mediaURL: mediaURL) else { return }
         persistHistoryIfNeeded(force: false, currentProgress: seconds)
     }
     
     private func persistHistoryIfNeeded(force: Bool, currentProgress: Double? = nil) {
+        // 播放会话已结束时不再写入进度（例如切到没有剧集的线路）。
         guard viewModel.isPlaying else { return }
         let progress = max(currentProgress ?? viewModel.currentPlaybackSeconds(), 0)
         guard progress.isFinite else { return }
@@ -536,33 +687,50 @@ struct DetailView: View {
     }
     
     private func restorePlaybackFromHistory() {
-        guard let playbackState = CacheStore.shared.getPlaybackState(
-            vodId: video.id,
-            sourceKey: video.sourceKey,
+        guard viewModel.vodInfo != nil else { return }
+        let record = recordVideo
+        var playbackState = CacheStore.shared.getPlaybackState(
+            vodId: record.vodId,
+            sourceKey: record.sourceKey,
+            sourceApi: record.sourceApi,
             context: modelContext
-        ) else { return }
+        )
+        if playbackState == nil, video.sourceKey.isEmpty {
+            // 极旧版本留下的无来源记录：按原始身份再查一次。
+            playbackState = CacheStore.shared.getPlaybackState(
+                vodId: video.vodId,
+                sourceKey: video.sourceKey,
+                context: modelContext
+            )
+        }
+        guard let playbackState else { return }
         
         viewModel.applyPlaybackState(playbackState)
         lastPersistedProgress = max(playbackState.progressSeconds, 0)
     }
     
     private func refreshCollectState() {
+        guard viewModel.vodInfo != nil else { return }
+        let record = recordVideo
         isCollected = CacheStore.shared.isCollected(
-            vodId: video.id,
-            sourceKey: video.sourceKey,
+            vodId: record.vodId,
+            sourceKey: record.sourceKey,
+            sourceApi: record.sourceApi,
             context: modelContext
         )
     }
     
     private func toggleCollect() {
+        let record = recordVideo
         if isCollected {
             CacheStore.shared.removeCollect(
-                vodId: video.id,
-                sourceKey: video.sourceKey,
+                vodId: record.vodId,
+                sourceKey: record.sourceKey,
+                sourceApi: record.sourceApi,
                 context: modelContext
             )
         } else {
-            CacheStore.shared.addCollect(video, context: modelContext)
+            CacheStore.shared.addCollect(record, context: modelContext)
         }
         refreshCollectState()
     }
@@ -625,7 +793,9 @@ struct DetailView: View {
 struct FullScreenPlayerView: View {
     let urlString: String
     var startPosition: Double = 0
-    var onProgressChanged: ((Double, Double?) -> Void)? = nil
+    var qualityConstraint: PlaybackQualityConstraint? = nil
+    var httpHeaders: [String: String] = [:]
+    var onProgressChanged: ((Double, Double?, String) -> Void)? = nil
     var onPlaybackEnded: (() -> Void)? = nil
     var canPlayNext: Bool = false
     var onPlayNext: (() -> Void)? = nil
@@ -641,6 +811,8 @@ struct FullScreenPlayerView: View {
             PlayerView(
                 urlString: urlString,
                 startPosition: startPosition,
+                qualityConstraint: qualityConstraint,
+                httpHeaders: httpHeaders,
                 onProgressChanged: onProgressChanged,
                 onPlaybackEnded: onPlaybackEnded,
                 onToggleFullScreen: {

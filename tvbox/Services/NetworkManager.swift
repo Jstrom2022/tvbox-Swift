@@ -7,6 +7,27 @@ class NetworkManager {
     
     /// 默认最大重试次数（不含首次请求）。
     static let defaultMaxRetries = 2
+    /// 媒体与图片请求使用的默认 User-Agent（部分 CDN 会拒绝没有浏览器 UA 的请求）。
+    /// 配置中声明了 `ua` 的直播源优先使用配置值。
+    static let defaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+    /// 文本响应及其最终地址（跟随重定向之后），解析相对资源时必须以最终地址为基准。
+    struct TextResponse {
+        let text: String
+        let finalURL: URL
+    }
+
+    /// 请求失败后的重试策略。
+    enum RetryPolicy {
+        /// 网络瞬态错误、超时与 408/429/5xx 都重试（配置、列表等廉价且幂等的请求）。
+        case standard
+        /// 只重试连接没有建立起来的错误（找不到主机、连不上、断网等）。
+        /// 用于服务端现场执行耗时逻辑的接口（如 T4）：超时与 5xx 多是确定性失败，
+        /// 重试只会成倍拉长等待，并让服务端把同一段逻辑重复执行。
+        case connectionOnly
+    }
+    /// 服务端错误提示的最大展示长度。
+    private static let maxServerMessageLength = 200
     /// 重试基础延迟（秒），实际延迟 = base * 2^attempt + jitter。
     private static let retryBaseDelay: TimeInterval = 0.5
     /// 重试最大延迟上限（秒）。
@@ -55,26 +76,50 @@ class NetworkManager {
     }
     
     /// GET 请求获取字符串，支持自动重试。
+    /// - Parameter timeout: 单次请求超时（秒），覆盖会话默认的 15 秒；为空时使用会话默认值。
     func getString(
         from urlString: String,
         headers: [String: String]? = nil,
-        maxRetries: Int = NetworkManager.defaultMaxRetries
+        maxRetries: Int = NetworkManager.defaultMaxRetries,
+        timeout: TimeInterval? = nil,
+        retryPolicy: RetryPolicy = .standard
     ) async throws -> String {
+        try await getTextResponse(
+            from: urlString,
+            headers: headers,
+            maxRetries: maxRetries,
+            timeout: timeout,
+            retryPolicy: retryPolicy
+        ).text
+    }
+
+    /// GET 请求获取字符串，同时返回重定向后的最终地址。
+    func getTextResponse(
+        from urlString: String,
+        headers: [String: String]? = nil,
+        maxRetries: Int = NetworkManager.defaultMaxRetries,
+        timeout: TimeInterval? = nil,
+        retryPolicy: RetryPolicy = .standard
+    ) async throws -> TextResponse {
         guard let url = URL(string: urlString.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             throw NetworkError.invalidURL(urlString)
         }
-        
+
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        // 请求级超时会覆盖会话配置的 timeoutIntervalForRequest（总时长仍受 timeoutIntervalForResource 约束）。
+        if let timeout {
+            request.timeoutInterval = timeout
+        }
         headers?.forEach { request.setValue($1, forHTTPHeaderField: $0) }
-        
-        let (data, httpResponse) = try await performRequest(request, maxRetries: maxRetries)
-        
+
+        let (data, httpResponse) = try await performRequest(request, maxRetries: maxRetries, retryPolicy: retryPolicy)
+
         guard let str = Self.decodeString(data: data, response: httpResponse) else {
             throw NetworkError.decodingError("文本解码失败")
         }
-        
-        return str
+
+        return TextResponse(text: str, finalURL: httpResponse.url ?? url)
     }
     
     /// GET 请求获取字符串，同时返回跟随重定向后的最终地址
@@ -131,7 +176,8 @@ class NetworkManager {
     /// 执行 HTTP 请求，遇到可重试错误时自动指数退避重试。
     private func performRequest(
         _ request: URLRequest,
-        maxRetries: Int
+        maxRetries: Int,
+        retryPolicy: RetryPolicy = .standard
     ) async throws -> (Data, HTTPURLResponse) {
         var lastError: Error = NetworkError.invalidResponse
         let totalAttempts = max(1, maxRetries + 1)
@@ -147,8 +193,11 @@ class NetworkManager {
                 }
                 
                 guard (200...299).contains(httpResponse.statusCode) else {
-                    let error = NetworkError.httpError(httpResponse.statusCode)
-                    if Self.isRetryableHTTPStatus(httpResponse.statusCode) && attempt < totalAttempts - 1 {
+                    let error = NetworkError.httpError(
+                        httpResponse.statusCode,
+                        message: Self.serverMessage(from: data)
+                    )
+                    if Self.isRetryableHTTPStatus(httpResponse.statusCode, policy: retryPolicy) && attempt < totalAttempts - 1 {
                         lastError = error
                         try await retryDelay(attempt: attempt)
                         continue
@@ -161,7 +210,7 @@ class NetworkManager {
                 throw CancellationError()
             } catch {
                 lastError = error
-                if Self.isRetryableError(error) && attempt < totalAttempts - 1 {
+                if Self.isRetryableError(error, policy: retryPolicy) && attempt < totalAttempts - 1 {
                     try await retryDelay(attempt: attempt)
                     continue
                 }
@@ -172,6 +221,23 @@ class NetworkManager {
         throw lastError
     }
     
+    /// 从错误响应体中提取服务端给出的提示（如 drpy-node 的 `{"error": "..."}`）。
+    /// 只认 JSON 对象中的 error / msg / message 字符串字段，HTML 等其他内容不展示。
+    static func serverMessage(from data: Data) -> String? {
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return nil
+        }
+        for key in ["error", "msg", "message"] {
+            guard let value = json[key] as? String else { continue }
+            let message = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !message.isEmpty else { continue }
+            return message.count > maxServerMessageLength
+                ? String(message.prefix(maxServerMessageLength)) + "…"
+                : message
+        }
+        return nil
+    }
+    
     /// 指数退避延迟 + 随机抖动，避免多请求同时重试造成惊群效应。
     private func retryDelay(attempt: Int) async throws {
         let base = Self.retryBaseDelay * pow(2.0, Double(attempt))
@@ -180,8 +246,9 @@ class NetworkManager {
         try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
     }
     
-    /// 判断 HTTP 状态码是否值得重试（仅服务端临时错误）。
-    private static func isRetryableHTTPStatus(_ statusCode: Int) -> Bool {
+    /// 判断 HTTP 状态码是否值得重试（仅服务端临时错误；`connectionOnly` 策略一律不重试）。
+    static func isRetryableHTTPStatus(_ statusCode: Int, policy: RetryPolicy = .standard) -> Bool {
+        guard policy == .standard else { return false }
         switch statusCode {
         case 408, 429, 500, 502, 503, 504: return true
         default: return false
@@ -189,12 +256,12 @@ class NetworkManager {
     }
     
     /// 判断错误是否为可重试的瞬态网络错误。
-    private static func isRetryableError(_ error: Error) -> Bool {
+    static func isRetryableError(_ error: Error, policy: RetryPolicy = .standard) -> Bool {
         if error is CancellationError { return false }
         
         if let networkError = error as? NetworkError {
-            if case .httpError(let code) = networkError {
-                return isRetryableHTTPStatus(code)
+            if case .httpError(let code, _) = networkError {
+                return isRetryableHTTPStatus(code, policy: policy)
             }
             if case .invalidURL = networkError { return false }
             if case .decodingError = networkError { return false }
@@ -203,8 +270,7 @@ class NetworkManager {
         let nsError = error as NSError
         if nsError.domain == NSURLErrorDomain {
             switch nsError.code {
-            case NSURLErrorTimedOut,
-                 NSURLErrorCannotFindHost,
+            case NSURLErrorCannotFindHost,
                  NSURLErrorCannotConnectToHost,
                  NSURLErrorNetworkConnectionLost,
                  NSURLErrorDNSLookupFailed,
@@ -212,6 +278,9 @@ class NetworkManager {
                  NSURLErrorSecureConnectionFailed,
                  NSURLErrorDataNotAllowed:
                 return true
+            case NSURLErrorTimedOut:
+                // 超时说明请求已经到达服务端：耗时接口重试只会让服务端把同一段逻辑再执行一遍。
+                return policy == .standard
             default:
                 return false
             }
@@ -268,7 +337,8 @@ class NetworkManager {
 enum NetworkError: LocalizedError {
     case invalidURL(String)
     case invalidResponse
-    case httpError(Int)
+    /// 非 2xx 响应；`message` 为响应体中服务端给出的错误提示（没有时为空）。
+    case httpError(Int, message: String? = nil)
     case decodingError(String)
     
     /// 面向 UI/日志的错误描述。
@@ -276,7 +346,11 @@ enum NetworkError: LocalizedError {
         switch self {
         case .invalidURL(let url): return "无效的URL: \(url)"
         case .invalidResponse: return "无效的响应"
-        case .httpError(let code): return "HTTP 错误: \(code)"
+        case .httpError(let code, let message):
+            if let message, !message.isEmpty {
+                return "HTTP 错误: \(code)，服务端提示：\(message)"
+            }
+            return "HTTP 错误: \(code)"
         case .decodingError(let msg): return "解码错误: \(msg)"
         }
     }

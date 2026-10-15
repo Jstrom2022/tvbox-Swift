@@ -132,6 +132,12 @@ struct HistoryView: View {
     
     /// 将历史记录转换为详情页的入参模型。
     private func movieVideo(from item: VodRecord) -> Movie.Video {
-        Movie.Video(id: item.vodId, name: item.vodName, pic: item.vodPic, sourceKey: item.sourceKey)
+        Movie.Video(
+            vodId: item.vodId,
+            name: item.vodName,
+            pic: item.vodPic,
+            sourceKey: item.sourceKey,
+            sourceApi: item.sourceApi
+        )
     }
 }

@@ -128,15 +128,15 @@ struct ChannelOverlayView: View {
                         .padding(.vertical, 20)
                         .frame(maxWidth: .infinity)
                 } else {
-                    ForEach(Array(currentChannels.enumerated()), id: \.offset) { _, channel in
+                    ForEach(currentChannels) { channel in
                         Button {
                             HapticManager.shared.mediumImpact()
                             onSelectChannel(channel)
                         } label: {
                             HStack {
                                 Text(channel.channelName)
-                                    .font(.system(size: 14, weight: currentChannel?.channelName == channel.channelName ? .bold : .medium))
-                                    .foregroundColor(currentChannel?.channelName == channel.channelName ? .orange : .white.opacity(0.8))
+                                    .font(.system(size: 14, weight: currentChannel?.id == channel.id ? .bold : .medium))
+                                    .foregroundColor(currentChannel?.id == channel.id ? .orange : .white.opacity(0.8))
 
                                 Spacer()
 
@@ -149,7 +149,7 @@ struct ChannelOverlayView: View {
                                         .background(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 0.5))
                                 }
 
-                                if currentChannel?.channelName == channel.channelName {
+                                if currentChannel?.id == channel.id {
                                     Image(systemName: "speaker.wave.2.fill")
                                         .font(.system(size: 10))
                                         .foregroundColor(.orange)
@@ -158,7 +158,7 @@ struct ChannelOverlayView: View {
                             .padding(.horizontal, 16)
                             .frame(minHeight: 48)
                             .background(
-                                currentChannel?.channelName == channel.channelName
+                                currentChannel?.id == channel.id
                                     ? Color.orange.opacity(0.15)
                                     : Color.clear
                             )

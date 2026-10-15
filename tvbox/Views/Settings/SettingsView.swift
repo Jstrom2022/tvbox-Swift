@@ -134,7 +134,7 @@ struct SettingsView: View {
                     
                     // 关于
                     SectionCard(title: "关于") {
-                        SettingsRow(icon: "info.circle", title: "版本", value: appVersionText, action: nil)
+                        SettingsRow(icon: "info.circle", title: "版本", value: Bundle.main.appVersionDescription, action: nil)
                         Divider().background(Color.white.opacity(0.1))
                         SettingsRow(icon: "globe", title: "站点数量", value: "\(apiConfig.sourceBeanList.count)", action: nil)
                         Divider().background(Color.white.opacity(0.1))

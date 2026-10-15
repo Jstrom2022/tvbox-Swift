@@ -40,7 +40,7 @@ struct ProfileView: View {
                 .resizable()
                 .frame(width: 72, height: 72)
                 .clipShape(RoundedRectangle(cornerRadius: 16))
-            Text("TVBox v\(appVersion)")
+            Text("TVBox v\(Bundle.main.appVersionDescription)")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
@@ -59,12 +59,6 @@ struct ProfileView: View {
                 .font(.body)
         }
         .frame(minHeight: 44)
-    }
-
-    // MARK: - App Version
-
-    private var appVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
     }
 }
 #endif

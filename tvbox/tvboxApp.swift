@@ -21,7 +21,9 @@ struct tvboxApp: App {
         ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
         do {
-            return try ModelContainer(for: schema, configurations: [modelConfiguration])
+            let container = try ModelContainer(for: schema, configurations: [modelConfiguration])
+            CacheStore.migrateBusinessKeysIfNeeded(in: container)
+            return container
         } catch {
             fatalError("Could not create ModelContainer: \(error)")
         }
@@ -55,6 +57,8 @@ class AppState: ObservableObject {
     @Published var configLoadError: String?
     /// 是否正在重试加载配置。
     @Published var isRetryingConfig = false
+    /// 是否正在通过启动恢复/自动重试加载配置（首次配置页据此展示进度）。
+    @Published var isLoadingConfig = false
     
     #if os(macOS)
     /// macOS 三栏布局可见性（侧栏/内容/详情）。
@@ -90,14 +94,16 @@ class AppState: ObservableObject {
         lastVodUrl = trimmedVod
         lastLiveUrl = resolvedLive
         configLoadError = nil
-        
+        isLoadingConfig = true
+        defer { isLoadingConfig = false }
+
         do {
             try await ApiConfig.shared.loadConfigs(vodApiUrl: trimmedVod, liveApiUrl: resolvedLive)
             applyLoadedConfigState()
+        } catch is CancellationError {
+            // 被更新的加载请求取代：状态由新的请求负责提交，这里不报错也不标记成功。
         } catch {
-            if !(error is CancellationError) {
-                configLoadError = error.localizedDescription
-            }
+            configLoadError = error.localizedDescription
         }
     }
     
@@ -116,6 +122,8 @@ class AppState: ObservableObject {
                 guard let self else { return }
                 Task { @MainActor [weak self] in
                     guard let self, !self.isConfigLoaded, !self.lastVodUrl.isEmpty else { return }
+                    // 用户正在手动加载其他地址时不自动重试，避免旧地址覆盖用户的新请求。
+                    guard !ApiConfig.shared.hasLoadInFlight else { return }
                     self.isRetryingConfig = true
                     await self.loadConfig(vodUrl: self.lastVodUrl, liveUrl: self.lastLiveUrl)
                     self.isRetryingConfig = false

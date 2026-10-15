@@ -42,14 +42,7 @@ struct HomeView: View {
             .background(AppTheme.primaryGradient)
         }
         .task {
-            await viewModel.loadSorts()
-            if let first = viewModel.sorts.first {
-                viewModel.selectSort(first)
-            }
-        }
-        // 切换点播订阅（首页菜单或设置页）后重新加载分类与内容
-        .onChange(of: subscriptionStore.active?.id) { _, _ in
-            Task { await viewModel.refresh() }
+            await viewModel.loadIfNeeded()
         }
         .overlay(alignment: .bottom) {
             if let error = subscriptionStore.lastError {
@@ -76,7 +69,7 @@ struct HomeView: View {
                     Section("点播订阅") {
                         ForEach(subscriptionStore.subscriptions) { subscription in
                             Button {
-                                // 首页刷新由下方 onChange(of: 当前订阅) 统一触发
+                                // 新配置加载完成后由 ViewModel 的配置订阅统一刷新
                                 Task { await subscriptionStore.activate(subscription, appState: appState) }
                             } label: {
                                 HStack {
@@ -92,8 +85,7 @@ struct HomeView: View {
                 Section("站点") {
                     ForEach(ApiConfig.shared.sourceBeanList.filter { $0.isSupportedInSwift }) { source in
                         Button {
-                            ApiConfig.shared.setHomeSource(source)
-                            Task { await viewModel.refresh() }
+                            Task { await viewModel.switchSource(source) }
                         } label: {
                             HStack {
                                 Text(source.name)
@@ -205,11 +197,6 @@ struct HomeView: View {
         .padding(.bottom, 4)
     }
     #endif
-    
-    private func categoryIndex(for id: String?) -> Int? {
-        guard let id else { return nil }
-        return viewModel.sorts.firstIndex(where: { $0.id == id })
-    }
     
     private func syncCategoryScrollAnchorIfNeeded() {
         guard !viewModel.sorts.isEmpty else {
@@ -343,79 +330,18 @@ struct HomeView: View {
 
     // MARK: - 内容区
     
+    /// 是否正在展示“推荐”（未选中任何分类时也视为推荐）。
+    private var isShowingHome: Bool {
+        viewModel.selectedSort == nil || viewModel.selectedSort?.id == "home"
+    }
+    
+    /// 内容区按当前选中的推荐/分类分别呈现加载、错误、空态与内容，互不遮蔽。
     private var contentArea: some View {
         Group {
-            if viewModel.isLoading && viewModel.categoryVideos.isEmpty && viewModel.homeVideos.isEmpty {
-                VStack {
-                    Spacer()
-                    ProgressView()
-                        .scaleEffect(1.5)
-                        .tint(.orange)
-                    Text("加载中...")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                        .padding(.top, 12)
-                    Spacer()
-                }
-            } else if let error = viewModel.errorMessage, viewModel.categoryVideos.isEmpty && viewModel.homeVideos.isEmpty {
-                VStack(spacing: 12) {
-                    Spacer()
-                    Image(systemName: "exclamationmark.triangle")
-                        .font(.largeTitle)
-                        .foregroundColor(.orange)
-                    Text(error)
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 40)
-                    
-                    // 如果是不支持的源类型，显示类型信息
-                    if let source = ApiConfig.shared.homeSourceBean, !source.isSupportedInSwift {
-                        Text("当前源类型: \(source.typeDescription)")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    
-                    Button("重试") {
-                        Task { await viewModel.refresh() }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.orange)
-                    Spacer()
-                }
+            if isShowingHome {
+                homeContent
             } else {
-                let videos = viewModel.selectedSort?.isHome == true
-                    ? viewModel.homeVideos
-                    : viewModel.categoryVideos
-                
-                ScrollView {
-                    LazyVGrid(columns: columns, spacing: 16) {
-                        ForEach(videos) { video in
-                            NavigationLink(value: video) {
-                                VodCardView(video: video)
-                            }
-                            #if os(iOS)
-                            .buttonStyle(VodCardPressStyle())
-                            #else
-                            .buttonStyle(.plain)
-                            #endif
-                            .onAppear {
-                                Task { await viewModel.loadMoreIfNeeded(currentItem: video) }
-                            }
-                        }
-                    }
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 12)
-                    
-                    // 加载更多
-                    if viewModel.selectedSort?.isHome == false && viewModel.hasMore {
-                        ProgressView()
-                            .padding()
-                    }
-                }
-                .refreshable {
-                    await viewModel.refresh()
-                }
+                categoryContent
             }
         }
         .navigationDestination(for: Movie.Video.self) { video in
@@ -426,6 +352,193 @@ struct HomeView: View {
                 DetailView(video: video)
             }
         }
+    }
+    @ViewBuilder
+    private var homeContent: some View {
+        if viewModel.homeVideos.isEmpty {
+            if viewModel.isLoadingHome || !viewModel.hasLoadedHome {
+                loadingState
+            } else if let error = viewModel.homeErrorMessage {
+                errorState(error) {
+                    Task { await viewModel.refresh() }
+                }
+            } else {
+                emptyState(message: "当前数据源没有推荐内容，可以切换到其他分类看看")
+            }
+        } else {
+            videoGrid(viewModel.homeVideos, banner: viewModel.homeErrorMessage.map { "刷新失败：\($0)" }) {
+                EmptyView()
+            }
+        }
+    }
+    
+    @ViewBuilder
+    private var categoryContent: some View {
+        if viewModel.categoryVideos.isEmpty {
+            if let error = viewModel.categoryErrorMessage {
+                errorState(error) {
+                    Task { await viewModel.retryCategory() }
+                }
+            } else if viewModel.isLoadingCategory || viewModel.isLoadingMore {
+                loadingState
+            } else if let error = viewModel.loadMoreErrorMessage {
+                errorState(error) { Task { await viewModel.retryLoadMore() } }
+            } else if viewModel.hasMore {
+                VStack(spacing: 12) {
+                    Spacer()
+                    Text("已加载内容中暂无符合筛选条件的影片")
+                        .foregroundColor(.secondary)
+                    Button("继续加载") { Task { await viewModel.loadMore() } }
+                        .buttonStyle(.bordered)
+                        .tint(.orange)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity)
+            } else {
+                emptyState(message: "该分类暂无内容")
+            }
+        } else {
+            videoGrid(viewModel.categoryVideos, banner: nil) {
+                paginationFooter
+            }
+        }
+    }
+    
+    /// 分页底部：加载中、失败重试或已到底。
+    @ViewBuilder
+    private var paginationFooter: some View {
+        if let error = viewModel.loadMoreErrorMessage {
+            VStack(spacing: 8) {
+                Text("加载更多失败：\(error)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                Button("重试") {
+                    Task { await viewModel.retryLoadMore() }
+                }
+                .buttonStyle(.bordered)
+                .tint(.orange)
+            }
+            .padding()
+        } else if viewModel.isLoadingMore {
+            ProgressView()
+                .padding()
+        } else if viewModel.hasMore {
+            // 列表较短、最后一张卡片已在屏幕内时，靠这里继续触发分页。
+            ProgressView()
+                .padding()
+                .onAppear {
+                    Task { await viewModel.loadMore() }
+                }
+        } else {
+            Text("没有更多了")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding()
+        }
+    }
+    
+    private func videoGrid<Footer: View>(
+        _ videos: [Movie.Video],
+        banner: String?,
+        @ViewBuilder footer: () -> Footer
+    ) -> some View {
+        ScrollView {
+            if let banner {
+                Text(banner)
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 8)
+            }
+            
+            LazyVGrid(columns: columns, spacing: 16) {
+                ForEach(videos) { video in
+                    NavigationLink(value: video) {
+                        VodCardView(video: video)
+                    }
+                    #if os(iOS)
+                    .buttonStyle(VodCardPressStyle())
+                    #else
+                    .buttonStyle(.plain)
+                    #endif
+                    .onAppear {
+                        Task { await viewModel.loadMoreIfNeeded(currentItem: video) }
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+            
+            footer()
+        }
+        .refreshable {
+            await viewModel.refresh()
+        }
+    }
+    
+    private var loadingState: some View {
+        VStack {
+            Spacer()
+            ProgressView()
+                .scaleEffect(1.5)
+                .tint(.orange)
+            Text("加载中...")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .padding(.top, 12)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+    
+    private func errorState(_ error: String, retry: @escaping () -> Void) -> some View {
+        VStack(spacing: 12) {
+            Spacer()
+            Image(systemName: "exclamationmark.triangle")
+                .font(.largeTitle)
+                .foregroundColor(.orange)
+            Text(error)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 40)
+            
+            // 如果是不支持的源类型，显示类型信息
+            if let source = ApiConfig.shared.homeSourceBean, !source.isSupportedInSwift {
+                Text("当前源类型: \(source.typeDescription)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            
+            Button("重试", action: retry)
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+    
+    private func emptyState(message: String) -> some View {
+        VStack(spacing: 12) {
+            Spacer()
+            Image(systemName: "film.stack")
+                .font(.largeTitle)
+                .foregroundColor(.secondary)
+            Text(message)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 40)
+            Button("刷新") {
+                Task { await viewModel.refresh() }
+            }
+            .buttonStyle(.bordered)
+            .tint(.orange)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
     }
 }
 
@@ -499,5 +612,6 @@ struct DoubanSearchView: View {
             await viewModel.search()
         }
     }
-}
+    
 
+}

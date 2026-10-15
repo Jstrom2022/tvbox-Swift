@@ -244,9 +244,7 @@ class SettingsViewModel: ObservableObject {
         decodeMode = VideoDecodeMode.fromStoredValue(
             defaults.integer(forKey: HawkConfig.PLAY_DECODE_MODE)
         )
-        vlcBufferMode = VLCBufferMode.fromStoredValue(
-            defaults.integer(forKey: HawkConfig.PLAY_VLC_BUFFER_MODE)
-        )
+        vlcBufferMode = VLCBufferMode.stored(in: defaults)
         
         let savedStep = defaults.integer(forKey: HawkConfig.PLAY_TIME_STEP)
         playTimeStep = savedStep > 0 ? savedStep : 10
@@ -291,6 +289,8 @@ class SettingsViewModel: ObservableObject {
             addToApiHistory(trimmedVod)
             addToApiHistory(resolvedLive)
             configSuccess = true
+        } catch is CancellationError {
+            // 已被更新的加载请求取代：既不提示失败，也不保存地址或报告成功。
         } catch {
             configError = error.localizedDescription
         }

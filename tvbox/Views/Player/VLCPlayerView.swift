@@ -11,7 +11,7 @@ import UIKit
 final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     static let supportedPlaybackRates: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
     private static let defaultVolume = 100
-    private static let maxVolume = 200
+    static let maxVolume = 200
     private static let drawableSizeChangeThreshold: CGFloat = 24
     private static let drawableRebindMinimumInterval: TimeInterval = 1.2
     // 这些选项在播放器实例级别生效，优先约束 libvlc 的追时钟/丢帧行为。
@@ -49,6 +49,10 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
     @Published var durationSeconds: Double = 0
     @Published var playbackRate: Float = 1.0
     @Published var volume: Int = defaultVolume
+    /// 播放失败原因（供 UI 展示与重试）。空表示当前没有错误。
+    @Published var playbackError: String?
+    /// 重试时使用的最近一次失败媒体信息。
+    private var lastFailedMedia: (url: URL, startPosition: Double, isLive: Bool)?
     #if os(macOS)
     private let persistentDrawableView = NSView(frame: .zero)
     private weak var lastAttachedContainer: NSView?
@@ -67,6 +71,12 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
     
     private var progressTimer: Timer?
     private var pendingSeekSeconds: Double?
+    /// 最近一次定位的目标与时间，用于等待播放器追上目标位置后再上报进度。
+    private var seekBaseline: (target: Double, at: Date)?
+    /// 当前媒体的选流约束、UA 与请求头，参与“是否需要重建媒体”的判断。
+    private var currentMediaConstraint: PlaybackQualityConstraint?
+    private var currentMediaUserAgent: String?
+    private var currentMediaHTTPHeaders: [String: String] = [:]
     private var isLive = false
     private var isInBufferingState = false
     private var pendingVodBufferingConfirmWorkItem: DispatchWorkItem?
@@ -93,6 +103,14 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
     private let progressPublishThreshold: Double = 0.25
     private let durationPublishThreshold: Double = 0.5
     private var lastNonZeroVolume = defaultVolume
+    /// 用户的播放意图：重绑画面等内部操作不得改变它。
+    private var wantsPlayback = false
+    /// 需要保留 HLS 主列表时的选流约束。
+    private var qualityConstraint: PlaybackQualityConstraint?
+    /// 直播来源要求的 User-Agent（来自配置的 `ua`）。
+    private var userAgent: String?
+    /// 点播来源要求的请求头（T4 play 接口返回）：VLC 媒体选项只能携带其中的 User-Agent 与 Referer。
+    private var httpHeaders: [String: String] = [:]
     
     override init() {
         super.init()
@@ -102,9 +120,7 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
         decodeMode = VideoDecodeMode.fromStoredValue(
             UserDefaults.standard.integer(forKey: HawkConfig.PLAY_DECODE_MODE)
         )
-        bufferMode = VLCBufferMode.fromStoredValue(
-            UserDefaults.standard.integer(forKey: HawkConfig.PLAY_VLC_BUFFER_MODE)
-        )
+        bufferMode = VLCBufferMode.stored()
         let savedVolumeObj = UserDefaults.standard.object(forKey: HawkConfig.PLAY_VOLUME)
         let savedVolume = savedVolumeObj != nil ? UserDefaults.standard.integer(forKey: HawkConfig.PLAY_VOLUME) : Self.defaultVolume
         volume = Self.normalizedVolume(from: savedVolume)
@@ -135,6 +151,9 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
         url: URL,
         startPosition: Double,
         isLive: Bool,
+        qualityConstraint: PlaybackQualityConstraint? = nil,
+        userAgent: String? = nil,
+        httpHeaders: [String: String] = [:],
         onProgressChanged: ((Double, Double?) -> Void)?,
         onPlaybackEnded: (() -> Void)?,
         onPlaybackFailed: (() -> Void)?
@@ -146,12 +165,20 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
         }
         syncDecodeModeFromSettings()
         syncBufferModeFromSettings()
+        // 约束、UA 或请求头变化也需要重建媒体，否则选流范围与请求头不会生效。
+        let mediaOptionsChanged = currentMediaConstraint != qualityConstraint
+            || currentMediaUserAgent != userAgent
+            || currentMediaHTTPHeaders != httpHeaders
+        self.qualityConstraint = qualityConstraint
+        self.userAgent = userAgent
+        self.httpHeaders = httpHeaders
         
         // 同一路径/同场景（点播或直播）时复用当前实例，避免切全屏触发重新加载
         if currentMediaURLString == targetURLString,
            currentMediaIsLive == isLive,
            currentMediaDecodeMode == decodeMode,
            currentMediaBufferMode == bufferMode,
+           !mediaOptionsChanged,
            mediaPlayer.media != nil {
             self.onProgressChanged = onProgressChanged
             self.onPlaybackEnded = onPlaybackEnded
@@ -169,11 +196,17 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
         cancelDelayedPreparingIndicator()
         cancelPendingVodBufferingConfirmation()
         isInBufferingState = false
+        // 只有开始新媒体才重置播放意图与错误；上面的复用分支（如进出全屏）必须保留用户的暂停意图。
+        wantsPlayback = true
+        playbackError = nil
+        lastFailedMedia = nil
+        seekBaseline = nil
         self.onProgressChanged = onProgressChanged
         self.onPlaybackEnded = onPlaybackEnded
         self.onPlaybackFailed = onPlaybackFailed
         self.isLive = isLive
-        pendingSeekSeconds = isLive ? nil : max(startPosition, 0)
+        // 只有确实需要定位时才标记为待应用，否则会永久屏蔽进度上报。
+        pendingSeekSeconds = (!isLive && startPosition > 0) ? startPosition : nil
         setPlaybackStatus(preparing: true, playing: false)
         resetProgressState()
         
@@ -188,8 +221,13 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
             "live-caching": cacheConfig.live,
             "file-caching": cacheConfig.file,
             "http-reconnect": 1,
-            "http-user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "http-user-agent": Self.resolvedUserAgent(Self.headerValue("User-Agent", in: httpHeaders) ?? userAgent)
         ]
+        if let referer = Self.headerValue("Referer", in: httpHeaders) {
+            mediaOptions["http-referrer"] = referer
+        }
+        // 依赖 HLS 主列表中带 URI 的外置音轨/字幕组时，保留主列表并按约束选流。
+        mediaOptions.merge(Self.adaptiveOptions(for: qualityConstraint)) { _, new in new }
         if !isLive {
             mediaOptions["avcodec-hurry-up"] = 0
             mediaOptions["clock-synchro"] = 0
@@ -219,6 +257,37 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
         currentMediaIsLive = isLive
         currentMediaDecodeMode = decodeMode
         currentMediaBufferMode = bufferMode
+        currentMediaConstraint = qualityConstraint
+        currentMediaUserAgent = userAgent
+        currentMediaHTTPHeaders = httpHeaders
+    }
+
+    /// 以当前媒体重新播放（播放失败后的重试入口）；返回是否发起了重试。
+    @discardableResult
+    func retryCurrentMedia() -> Bool {
+        let failed: (url: URL, startPosition: Double, isLive: Bool)?
+        if let lastFailedMedia {
+            failed = lastFailedMedia
+        } else if let urlString = currentMediaURLString, let url = URL(string: urlString) {
+            failed = (url: url, startPosition: isLive ? 0 : max(currentSeconds(), 0), isLive: isLive)
+        } else {
+            failed = nil
+        }
+        guard let failed else { return false }
+        // 清除当前媒体标记，确保不会走“同一地址复用”分支而是真正重新拉流。
+        currentMediaURLString = nil
+        play(
+            url: failed.url,
+            startPosition: failed.startPosition,
+            isLive: failed.isLive,
+            qualityConstraint: qualityConstraint,
+            userAgent: userAgent,
+            httpHeaders: httpHeaders,
+            onProgressChanged: onProgressChanged,
+            onPlaybackEnded: onPlaybackEnded,
+            onPlaybackFailed: onPlaybackFailed
+        )
+        return true
     }
     
     func stop() {
@@ -235,6 +304,15 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
         currentMediaIsLive = false
         currentMediaDecodeMode = .auto
         currentMediaBufferMode = .defaultMode
+        currentMediaConstraint = nil
+        currentMediaUserAgent = nil
+        currentMediaHTTPHeaders = [:]
+        wantsPlayback = false
+        qualityConstraint = nil
+        userAgent = nil
+        httpHeaders = [:]
+        playbackError = nil
+        lastFailedMedia = nil
         guard let player = _mediaPlayer else { return }
         // 立即静音（audio.volume 是轻量属性设置，不会 dispatch_sync）
         player.audio?.volume = 0
@@ -249,9 +327,13 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
     }
     
     func togglePlayback() {
-        if isPlaying {
+        // 用播放意图而非瞬时状态判断，避免缓冲中的点击被反转。
+        if wantsPlayback {
+            wantsPlayback = false
             mediaPlayer.pause()
         } else {
+            wantsPlayback = true
+            playbackError = nil
             mediaPlayer.play()
             applyPlaybackRate()
         }
@@ -442,7 +524,9 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
 
     private func resumePlaybackAfterDrawableRebindIfNeeded() {
         guard mediaPlayer.media != nil else { return }
-        if !mediaPlayer.isPlaying,
+        // 重绑画面只恢复渲染：用户主动暂停（wantsPlayback == false）时必须保持暂停。
+        if wantsPlayback,
+           !mediaPlayer.isPlaying,
            mediaPlayer.state != .opening,
            mediaPlayer.state != .buffering {
             mediaPlayer.play()
@@ -494,6 +578,7 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
         let maxSeconds = min(durationSeconds > 0 ? durationSeconds : Double(Int32.max) / 1000.0, Double(Int32.max) / 1000.0)
         let value = max(0, min(seconds, maxSeconds))
         mediaPlayer.time = VLCTime(int: Int32(value * 1000.0))
+        seekBaseline = (target: value, at: Date())
         emitProgress()
     }
     
@@ -525,6 +610,7 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
             cancelPendingVodBufferingConfirmation()
             setPlaybackStatus(preparing: false, playing: false)
             cancelBufferingFallbackTimer()
+            wantsPlayback = false
             onPlaybackEnded?()
         case .error:
             isInBufferingState = false
@@ -532,6 +618,8 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
             cancelPendingVodBufferingConfirmation()
             setPlaybackStatus(preparing: false, playing: false)
             cancelBufferingFallbackTimer()
+            wantsPlayback = false
+            recordPlaybackFailure()
             onPlaybackFailed?()
         case .stopped:
             isInBufferingState = false
@@ -571,7 +659,17 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
     private func emitProgress() {
         refreshPlaybackFlags()
         guard !isLive else { return }
+        // 起播定位尚未应用时读到的是旧位置，上报会让上层丢掉续播进度。
+        guard pendingSeekSeconds == nil else { return }
         let current = currentSeconds()
+        // 定位刚下发时播放器可能仍返回旧位置，等它追上目标后再上报。
+        if let baseline = seekBaseline {
+            if Date().timeIntervalSince(baseline.at) < 2.0,
+               abs(current - baseline.target) > 0.5 {
+                return
+            }
+            seekBaseline = nil
+        }
         guard current.isFinite, current >= 0 else { return }
         
         let roundedCurrent = (current / progressPublishThreshold).rounded() * progressPublishThreshold
@@ -600,6 +698,7 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
             cancelDelayedPreparingIndicator()
             cancelPendingVodBufferingConfirmation()
             setPlaybackStatus(preparing: false, playing: true)
+            playbackError = nil
             cancelBufferingFallbackTimer()
             return
         }
@@ -688,10 +787,14 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
         hasAttemptedSoftDecodeFallback = true
         decodeModeOverride = .software
         let resumePosition = isLive ? 0 : max(currentSeconds(), 0)
+        // 只改变解码方式：选流约束、UA 与请求头必须沿用，否则回退后的媒体会丢失它们。
         play(
             url: url,
             startPosition: resumePosition,
             isLive: isLive,
+            qualityConstraint: qualityConstraint,
+            userAgent: userAgent,
+            httpHeaders: httpHeaders,
             onProgressChanged: onProgressChanged,
             onPlaybackEnded: onPlaybackEnded,
             onPlaybackFailed: onPlaybackFailed
@@ -806,6 +909,68 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
         bufferingBaselineSecondsVod = 0
     }
     
+    /// 记录失败信息，供 UI 展示原因并提供重试。
+    private func recordPlaybackFailure() {
+        if let urlString = currentMediaURLString, let url = URL(string: urlString) {
+            lastFailedMedia = (url: url, startPosition: isLive ? 0 : max(currentSeconds(), 0), isLive: isLive)
+        }
+        if playbackError == nil {
+            let unsupportedHeaders = Self.unsupportedHeaderNames(in: httpHeaders)
+            if !isLive && !unsupportedHeaders.isEmpty {
+                playbackError = "该资源需要携带 \(unsupportedHeaders.joined(separator: "、")) 请求头，VLC 内核目前只支持 User-Agent 与 Referer，请改用系统播放器"
+            } else {
+                playbackError = isLive
+                    ? "直播流无法播放，请重试或切换线路"
+                    : "该资源无法播放，可能是地址失效或编码不受支持"
+            }
+        }
+    }
+
+    /// 应用选流约束：在保留主列表的前提下，把自适应选流限制到目标档位。
+    /// - 有码率时用固定码率策略，选择不超过目标 BANDWIDTH 的最高档（同分辨率不同码率也能区分）；
+    /// - 同时用最大宽高排除更高分辨率的档位。
+    private static func adaptiveOptions(for constraint: PlaybackQualityConstraint?) -> [String: Any] {
+        guard let constraint else { return [:] }
+        var options: [String: Any] = [:]
+
+        if constraint.peakBitRate > 0 {
+            options["adaptive-logic"] = "fixedrate"
+            // adaptive-bw 单位为 KiB/s（libvlc 内部 ×8192 换算为 bit/s），向上取整避免目标档位被排除。
+            options["adaptive-bw"] = max(1, Int((Double(constraint.peakBitRate) / 8192).rounded(.up)))
+        } else {
+            options["adaptive-logic"] = "highest"
+        }
+        if let height = constraint.maxHeight, height > 0 {
+            options["adaptive-maxheight"] = height
+        }
+        if let width = constraint.maxWidth, width > 0 {
+            options["adaptive-maxwidth"] = width
+        }
+        return options
+    }
+
+    static func resolvedUserAgent(_ configured: String?) -> String {
+        guard let configured, !configured.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return NetworkManager.defaultUserAgent
+        }
+        return configured
+    }
+
+    /// 按名称（不区分大小写）读取请求头。
+    static func headerValue(_ name: String, in headers: [String: String]) -> String? {
+        headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
+    }
+
+    /// VLC 媒体选项无法携带的请求头（User-Agent 与 Referer 之外的，如 Cookie）。
+    static func unsupportedHeaderNames(in headers: [String: String]) -> [String] {
+        headers.keys
+            .filter {
+                $0.caseInsensitiveCompare("User-Agent") != .orderedSame
+                    && $0.caseInsensitiveCompare("Referer") != .orderedSame
+            }
+            .sorted()
+    }
+
     private func setPlaybackStatus(preparing: Bool, playing: Bool) {
         if isPreparing != preparing {
             isPreparing = preparing
@@ -840,7 +1005,10 @@ final class VLCPlayerController: NSObject, ObservableObject, VLCMediaPlayerDeleg
 struct VLCVodPlayerView: View {
     let urlString: String
     var startPosition: Double = 0
-    var onProgressChanged: ((Double, Double?) -> Void)? = nil
+    var qualityConstraint: PlaybackQualityConstraint? = nil
+    /// 播放请求需要携带的 HTTP 头（VLC 只能携带 User-Agent 与 Referer）。
+    var httpHeaders: [String: String] = [:]
+    var onProgressChanged: ((Double, Double?, String) -> Void)? = nil
     var onPlaybackEnded: (() -> Void)? = nil
     var onToggleFullScreen: (() -> Void)? = nil
     var canPlayNext: Bool = false
@@ -856,6 +1024,8 @@ struct VLCVodPlayerView: View {
     @State private var osdOpacity: Double = 0
     @State private var osdTimer: Timer?
     @State private var startPlaybackTask: Task<Void, Never>?
+    /// VLC 画面缩放（捏合手势），换集/进出全屏时随视图重建复位，与系统内核一致。
+    @State private var videoZoomScale: CGFloat = 1.0
     
     private var controller: VLCPlayerController {
         sharedController ?? ownedController
@@ -865,6 +1035,10 @@ struct VLCVodPlayerView: View {
         ZStack {
             VLCDrawableView(controller: controller)
                 .background(Color.black)
+                #if os(iOS)
+                .scaleEffect(videoZoomScale)
+                #endif
+                .clipped()
             #if !os(iOS)
                 .onTapGesture(count: 2) {
                     onToggleFullScreen?()
@@ -877,6 +1051,10 @@ struct VLCVodPlayerView: View {
             if controller.isPreparing {
                 ProgressView()
                     .tint(.white)
+            }
+            
+            if let error = controller.playbackError {
+                playbackErrorPanel(error)
             }
             
             if let osdIcon = osdIcon {
@@ -896,9 +1074,20 @@ struct VLCVodPlayerView: View {
                 onSeek: { offset in controller.seek(by: offset) },
                 onTogglePlayPause: { togglePlaybackWithOSD() },
                 onToggleControls: { wakeUpControls() },
-                onZoomChanged: { _ in },
+                onZoomChanged: { scale in
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        videoZoomScale = scale
+                    }
+                },
                 currentTime: controller.currentTimeSeconds,
-                duration: controller.durationSeconds
+                duration: controller.durationSeconds,
+                currentVolume: Double(controller.volume) / Double(VLCPlayerController.maxVolume),
+                volumePercentScale: Double(VLCPlayerController.maxVolume),
+                // VLC 音量范围 0...200，提示百分比与实际音量一致（100% 为原始音量）。
+                onVolumeChanged: { normalized in
+                    controller.setVolume(Int((normalized * Double(VLCPlayerController.maxVolume)).rounded()))
+                    wakeUpControls()
+                }
             )
         }
         #endif
@@ -950,6 +1139,10 @@ struct VLCVodPlayerView: View {
             startPlayback()
             wakeUpControls()
         }
+        .onChange(of: qualityConstraint) { _, newValue in
+            // VLC 只能通过媒体选项限制选流，约束变化需要从当前位置重建媒体。
+            startPlayback(startPositionOverride: max(controller.currentTimeSeconds, 0), constraint: newValue)
+        }
         .onChange(of: controller.currentTimeSeconds) { _, newValue in
             if !isDraggingProgress {
                 draggingSeconds = newValue
@@ -992,12 +1185,50 @@ struct VLCVodPlayerView: View {
         showOSD(icon: controller.isPlaying ? "pause.fill" : "play.fill")
     }
     
-    private func startPlayback() {
+    /// 播放失败面板：给出可识别的原因与重试/换内核入口，避免无提示黑屏。
+    private func playbackErrorPanel(_ message: String) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 34))
+                .foregroundColor(.yellow)
+            Text("播放失败")
+                .font(.headline)
+                .foregroundColor(.white)
+            Text(message)
+                .font(.caption)
+                .foregroundColor(.white.opacity(0.7))
+                .multilineTextAlignment(.center)
+                .lineLimit(3)
+                .padding(.horizontal, 24)
+            HStack(spacing: 12) {
+                Button("重试") {
+                    controller.retryCurrentMedia()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+                
+                Button("改用系统播放器") {
+                    UserDefaults.standard.set(PlayerEngine.system.rawValue, forKey: HawkConfig.PLAY_TYPE_VOD)
+                }
+                .buttonStyle(.bordered)
+                .tint(.white)
+            }
+        }
+        .padding()
+    }
+    
+    private func startPlayback(
+        startPositionOverride: Double? = nil,
+        constraint: PlaybackQualityConstraint?? = nil
+    ) {
         guard let url = Self.sanitizedURL(from: urlString) else {
             print("[VLC] URL sanitization failed for: \(urlString)")
             return
         }
-        let targetStartPosition = max(startPosition, 0)
+        let targetStartPosition = max(startPositionOverride ?? startPosition, 0)
+        let targetConstraint = constraint ?? qualityConstraint
+        let mediaURLString = urlString
+        let progressHandler = onProgressChanged
         draggingSeconds = targetStartPosition
         startPlaybackTask?.cancel()
         startPlaybackTask = Task { @MainActor in
@@ -1008,7 +1239,11 @@ struct VLCVodPlayerView: View {
                 url: url,
                 startPosition: targetStartPosition,
                 isLive: false,
-                onProgressChanged: onProgressChanged,
+                qualityConstraint: targetConstraint,
+                httpHeaders: httpHeaders,
+                onProgressChanged: progressHandler.map { handler in
+                    { seconds, duration in handler(seconds, duration, mediaURLString) }
+                },
                 onPlaybackEnded: onPlaybackEnded,
                 onPlaybackFailed: nil
             )
@@ -1369,13 +1604,7 @@ struct VLCVodPlayerView: View {
     }
     
     private func playbackRateLabel(_ rate: Float) -> String {
-        if rate.rounded() == rate {
-            return "\(Int(rate))x"
-        }
-        if (rate * 10).rounded() == rate * 10 {
-            return "\(String(format: "%.1f", rate))x"
-        }
-        return "\(String(format: "%.2f", rate))x"
+        PlaybackRateFormatter.label(for: rate)
     }
 
     private var volumeIconName: String {
@@ -1392,8 +1621,12 @@ struct VLCVodPlayerView: View {
 
 struct VLCLivePlayerView: View {
     let urlString: String
+    /// 来源配置要求的 User-Agent（配置 `ua` 字段），未配置时使用默认值。
+    var userAgent: String? = nil
     var activityToken: Int = 0
     var onPlaybackFailed: (() -> Void)? = nil
+    /// 开始出画时回调，供上层清除失败状态。
+    var onPlaybackStarted: (() -> Void)? = nil
     var onToggleFullScreen: (() -> Void)? = nil
     @StateObject private var controller = VLCPlayerController()
     private var volumeStep: Int { 10 }
@@ -1482,6 +1715,11 @@ struct VLCLivePlayerView: View {
         .onChange(of: activityToken) { _, _ in
             wakeUpControls()
         }
+        .onChange(of: controller.isPlaying) { _, isPlaying in
+            if isPlaying {
+                onPlaybackStarted?()
+            }
+        }
         .onDisappear {
             controller.stop()
             osdTimer?.invalidate()
@@ -1554,6 +1792,7 @@ struct VLCLivePlayerView: View {
             url: url,
             startPosition: 0,
             isLive: true,
+            userAgent: userAgent,
             onProgressChanged: nil,
             onPlaybackEnded: nil,
             onPlaybackFailed: onPlaybackFailed
@@ -1951,16 +2190,22 @@ final class VLCPlayerController: ObservableObject {
 struct VLCVodPlayerView: View {
     let urlString: String
     var startPosition: Double = 0
-    var onProgressChanged: ((Double, Double?) -> Void)? = nil
+    var qualityConstraint: PlaybackQualityConstraint? = nil
+    /// 播放请求需要携带的 HTTP 头（未集成 VLCKit 时原样交给系统播放器）。
+    var httpHeaders: [String: String] = [:]
+    var onProgressChanged: ((Double, Double?, String) -> Void)? = nil
     var onPlaybackEnded: (() -> Void)? = nil
     var onToggleFullScreen: (() -> Void)? = nil
     var canPlayNext: Bool = false
     var onPlayNext: (() -> Void)? = nil
+    var sharedController: VLCPlayerController? = nil
     
     var body: some View {
         AVPlayerContentView(
             urlString: urlString,
             startPosition: startPosition,
+            qualityConstraint: qualityConstraint,
+            httpHeaders: httpHeaders,
             onProgressChanged: onProgressChanged,
             onPlaybackEnded: onPlaybackEnded,
             onToggleFullScreen: onToggleFullScreen,
@@ -1972,7 +2217,10 @@ struct VLCVodPlayerView: View {
 
 struct VLCLivePlayerView: View {
     let urlString: String
+    var userAgent: String? = nil
+    var activityToken: Int = 0
     var onPlaybackFailed: (() -> Void)? = nil
+    var onPlaybackStarted: (() -> Void)? = nil
     var onToggleFullScreen: (() -> Void)? = nil
     
     var body: some View {
